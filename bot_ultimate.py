@@ -1631,7 +1631,7 @@ Est. Fees:    ${fees_estimated:.2f}
 # ============================================================================
 def main():
     print("="*60)
-    print("ULTIMATE TRADING BOT v2.0")
+    print("ULTIMATE TRADING BOT v3.0")
     print("Technical + Sentiment Analysis")
     print("="*60)
     print()
