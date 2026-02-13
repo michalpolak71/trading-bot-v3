@@ -1051,8 +1051,7 @@ class UltimateBot:
         technical_entry = (
             (price <= vwap_val * bps_to_mult(-self.cfg.entry_bps)) and
             (rsi_val <= self.cfg.rsi_buy) and
-            trend_ok and
-            bb_ok
+            trend_ok
         )
 
         sentiment_ok = True
@@ -1086,7 +1085,12 @@ class UltimateBot:
         if pos_qty == 0:
             if entry_trigger and cooled and can_trade and safe:
                 # v4.0: Risk-based position sizing
-                qty = self.calculate_position_size(equity, price, atr_val, cash)
+                # BB bonus: if Bollinger confirms, use higher risk per trade
+                if bb_ok and self.cfg.bb_filter_enabled:
+                    risk_mult = 1.5  # 50% bigger position
+                else:
+                    risk_mult = 1.0
+                qty = self.calculate_position_size(equity, price, atr_val, cash) * risk_mult
                 if qty > 0:
                     self.last_trade[sym] = time.time()
                     action = "BUY"
