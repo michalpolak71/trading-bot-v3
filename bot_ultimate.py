@@ -307,7 +307,7 @@ def can_trade_now() -> bool:
     import pytz
     tz_ny = pytz.timezone('America/New_York')
     now_ny = datetime.now(tz_ny)
-    trade_start = now_ny.replace(hour=11, minute=30, second=0, microsecond=0)
+    trade_start = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
     return now_ny >= trade_start
 
 
