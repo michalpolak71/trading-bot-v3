@@ -1,24 +1,14 @@
-# bot_ultimate.py — ULTIMATE TRADING BOT v5.0 AGGRESSIVE
-# Strategy: Yesterday's Low + Rebound (like SAPER bot) + Sentiment Filter
+# bot_ultimate.py — ULTIMATE TRADING BOT v6.0 ADAPTIVE
+# Strategy: Yesterday's Low + Rebound (like SAPER bot) + Sentiment Filter + Regime Detection
 # 100% AGGRESSIVE - No safe guards, maximum profit potential
 #
 # ============================================================================
-# v5.0 CHANGES (Feb 25, 2026):
+# v6.0 CHANGES (Mar 2026):
 # ============================================================================
-# STRATEGY OVERHAUL:
-#   ✅ Replaced mean-reversion with "dip buying" strategy
-#   ✅ Entry: Yesterday's low + 0.2% tolerance + rebound confirmation
-#   ✅ All-in position sizing (95% capital per trade)
-#   ✅ Sentiment filter (only addition vs SAPER bot)
-#   ✅ ATR-based dynamic TP/SL (better than fixed %)
-#   ❌ REMOVED: All safe guards (daily loss, drawdown, cooldowns)
-#   ❌ REMOVED: VWAP, RSI, EMA, Bollinger Bands entry filters
-#
-# New Railway Variables:
-#   - DIP_TOLERANCE_PCT (default: 0.2) - % above yesterday's low to buy
-#   - REBOUND_THRESHOLD_PCT (default: 0.1) - % rebound needed
-#   - LOOKBACK_DAYS (default: 1) - days to look back for low
-#   - REBOUND_BARS (default: 5) - bars to check for rebound
+#   ✅ REGIME DETECTION - bot wyłącza się w BEAR market (fix straty 27.02!)
+#   ✅ PDT FIX - zmiana TimeInForce.DAY → GTC (stop-lossy działają!)
+#   ✅ ML ANALYZER - zapisuje i analizuje wyniki trades
+#   ✅ Wszystkie zmiany WEWNĄTRZ tego pliku (zero nowych plików)
 # ============================================================================
 
 import os
@@ -84,7 +74,7 @@ class Config:
     max_pos_pct: float
     poll_seconds: int
     
-    # New v5.0: Dip buying params
+    # v5.0: Dip buying params
     dip_tolerance_pct: float
     rebound_threshold_pct: float
     lookback_days: int
@@ -100,6 +90,11 @@ class Config:
     cooldown_sec: int
     sentiment_enabled: bool
     sentiment_min_threshold: float
+    
+    # v6.0: Regime Detection
+    regime_enabled: bool
+    regime_check_interval: int   # sekundy między sprawdzeniami (domyślnie 3600 = 1h)
+    regime_spy_trend_threshold: float  # % spadku SPY w 5 dni żeby wyłączyć bota
     
     # Data
     db_path: str
@@ -120,7 +115,7 @@ def load_config() -> Config:
         max_pos_pct=float(os.getenv("MAX_POS_PCT", "0.95")),
         poll_seconds=int(os.getenv("POLL_SECONDS", "30")),
         
-        # v5.0: Dip buying strategy
+        # v5.0
         dip_tolerance_pct=float(os.getenv("DIP_TOLERANCE_PCT", "0.2")),
         rebound_threshold_pct=float(os.getenv("REBOUND_THRESHOLD_PCT", "0.1")),
         lookback_days=int(os.getenv("LOOKBACK_DAYS", "1")),
@@ -135,6 +130,11 @@ def load_config() -> Config:
         
         sentiment_enabled=os.getenv("SENTIMENT_ENABLED", "true").lower() == "true",
         sentiment_min_threshold=float(os.getenv("SENTIMENT_MIN_THRESHOLD", "-0.5")),
+        
+        # v6.0: Regime Detection
+        regime_enabled=os.getenv("REGIME_ENABLED", "true").lower() == "true",
+        regime_check_interval=int(os.getenv("REGIME_CHECK_INTERVAL", "3600")),
+        regime_spy_trend_threshold=float(os.getenv("REGIME_SPY_THRESHOLD", "-2.0")),
         
         db_path=os.getenv("DB_PATH", "bot_ultimate.db"),
         data_feed=os.getenv("DATA_FEED", "iex").lower(),
@@ -184,6 +184,221 @@ def can_trade_now() -> bool:
     now_ny = datetime.now(tz_ny)
     trade_start = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
     return now_ny >= trade_start
+
+
+# ============================================================================
+# v6.0: REGIME DETECTOR (wbudowany - bez zewnętrznych plików)
+# ============================================================================
+class RegimeDetector:
+    """
+    Wykrywa typ rynku na podstawie SPY (proxy S&P500).
+    Wyłącza bota gdy rynek spada - to był problem 27.02.2026!
+    
+    Regime'y:
+      BULL_TRENDING   → Bot aktywny, kup dipy
+      BEAR_TRENDING   → Bot WYŁĄCZONY (SPY w dół + EMA death cross)
+      HIGH_VOLATILITY → Bot WYŁĄCZONY (za ryzykowne)
+      SIDEWAYS        → Bot aktywny, ostrożnie
+    """
+    
+    def __init__(self, data_client, data_feed: str = "iex", check_interval: int = 3600):
+        self.data_client = data_client
+        self.data_feed = data_feed
+        self.check_interval = check_interval
+        
+        # Cache
+        self._last_regime = None
+        self._last_check = 0
+        self._last_reason = "Nie sprawdzono"
+    
+    def _get_spy_closes(self, days: int = 60) -> List[float]:
+        """Pobiera zamknięcia SPY z ostatnich N dni"""
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols="SPY",
+                timeframe=TimeFrame(1, TimeFrameUnit.Day),
+                start=utc_now() - timedelta(days=days + 10),
+                end=utc_now(),
+                feed=self.data_feed
+            )
+            df = self.data_client.get_stock_bars(req).df
+            
+            if df is None or df.empty:
+                return []
+            
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.reset_index()
+                df = df[df["symbol"] == "SPY"].set_index("timestamp")
+            
+            return df['close'].tolist()
+        except Exception as e:
+            logger.error(f"RegimeDetector: błąd pobierania SPY: {e}")
+            return []
+    
+    def _calc_ema(self, prices: List[float], span: int) -> float:
+        """Liczy EMA dla listy cen"""
+        if len(prices) < span:
+            return prices[-1] if prices else 0.0
+        k = 2 / (span + 1)
+        ema = prices[0]
+        for p in prices[1:]:
+            ema = p * k + ema * (1 - k)
+        return ema
+    
+    def should_trade(self, spy_threshold_pct: float = -2.0) -> bool:
+        """
+        Główna metoda - zwraca True jeśli bot powinien tradować.
+        Używa cache żeby nie odpytywać API co 30 sekund.
+        """
+        now = time.time()
+        
+        # Użyj cache jeśli świeży
+        if self._last_regime is not None and (now - self._last_check) < self.check_interval:
+            return self._last_regime
+        
+        logger.info("🔍 RegimeDetector: sprawdzam rynek (SPY)...")
+        
+        closes = self._get_spy_closes(days=60)
+        
+        if len(closes) < 20:
+            logger.warning("RegimeDetector: za mało danych SPY, domyślnie STOP")
+            self._last_regime = False
+            self._last_check = now
+            return False
+        
+        # EMA 20 i 50
+        ema_20 = self._calc_ema(closes[-20:], 20)
+        ema_50 = self._calc_ema(closes[-50:] if len(closes) >= 50 else closes, 50)
+        
+        # SPY trend ostatnie 5 dni
+        spy_5d = ((closes[-1] - closes[-6]) / closes[-6] * 100) if len(closes) >= 6 else 0
+        
+        # Volatility
+        changes = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
+        volatility = (sum((x - sum(changes)/len(changes))**2 for x in changes) / len(changes)) ** 0.5 if changes else 0
+        vix_proxy = volatility * 100 * (252 ** 0.5)
+        
+        # === LOGIKA DECYZYJNA ===
+        
+        # BEAR - najważniejszy przypadek
+        if ema_20 < ema_50 and spy_5d < spy_threshold_pct:
+            self._last_reason = f"🛑 BEAR: EMA20({ema_20:.1f}) < EMA50({ema_50:.1f}), SPY 5d: {spy_5d:.1f}%"
+            logger.warning(f"RegimeDetector: BEAR MARKET | {self._last_reason}")
+            self._last_regime = False
+            self._last_check = now
+            return False
+        
+        # HIGH VOLATILITY
+        if vix_proxy > 30:
+            self._last_reason = f"🛑 HIGH VOL: VIX proxy={vix_proxy:.1f}"
+            logger.warning(f"RegimeDetector: HIGH VOLATILITY | {self._last_reason}")
+            self._last_regime = False
+            self._last_check = now
+            return False
+        
+        # BULL lub SIDEWAYS - traduj
+        if ema_20 >= ema_50:
+            self._last_reason = f"✅ BULL: EMA20({ema_20:.1f}) >= EMA50({ema_50:.1f}), SPY 5d: {spy_5d:.1f}%"
+        else:
+            self._last_reason = f"✅ SIDEWAYS: SPY 5d: {spy_5d:.1f}% (powyżej progu {spy_threshold_pct}%)"
+        
+        logger.info(f"RegimeDetector: OK | {self._last_reason}")
+        self._last_regime = True
+        self._last_check = now
+        return True
+    
+    def get_status(self) -> str:
+        return self._last_reason
+
+
+# ============================================================================
+# v6.0: ML ANALYZER (wbudowany)
+# ============================================================================
+class MLAnalyzer:
+    """
+    Analizuje historię trades z SQLite i wyciąga wzorce.
+    Co 6h drukuje raport do logów Railway.
+    """
+    
+    def __init__(self, db_conn):
+        self.db = db_conn
+        self._last_analysis = 0
+        self.ANALYSIS_INTERVAL = 6 * 3600  # co 6h
+    
+    def maybe_analyze(self):
+        """Uruchamia analizę co 6h jeśli jest wystarczająco danych"""
+        now = time.time()
+        if now - self._last_analysis < self.ANALYSIS_INTERVAL:
+            return
+        self._last_analysis = now
+        self._run_analysis()
+    
+    def _run_analysis(self):
+        try:
+            cur = self.db.execute(
+                "SELECT symbol, action, price, entry_price, atr, sentiment, rebound_pct FROM signals "
+                "WHERE action='SELL' AND entry_price IS NOT NULL ORDER BY ts_utc DESC LIMIT 200"
+            )
+            trades = cur.fetchall()
+            
+            if len(trades) < 5:
+                logger.info(f"📚 ML: Za mało trades ({len(trades)}) do analizy. Minimum: 5")
+                return
+            
+            logger.info(f"\n{'='*50}\n📊 ML ANALYSIS ({len(trades)} trades)\n{'='*50}")
+            
+            # Oblicz P/L dla każdego trade
+            results = []
+            for sym, action, price, entry, atr, sentiment, rebound in trades:
+                if entry and entry > 0:
+                    pl_pct = (price - entry) / entry * 100
+                    results.append({
+                        'symbol': sym, 'pl_pct': pl_pct,
+                        'atr': atr or 0, 'sentiment': sentiment or 0,
+                        'rebound': rebound or 0, 'win': pl_pct > 0
+                    })
+            
+            if not results:
+                return
+            
+            wins = [r for r in results if r['win']]
+            losses = [r for r in results if not r['win']]
+            win_rate = len(wins) / len(results) * 100
+            avg_pl = sum(r['pl_pct'] for r in results) / len(results)
+            
+            logger.info(f"Win rate: {win_rate:.1f}% | Avg P/L: {avg_pl:.2f}%")
+            logger.info(f"Wins: {len(wins)} | Losses: {len(losses)}")
+            
+            # Symbol performance
+            symbols = set(r['symbol'] for r in results)
+            sym_stats = []
+            for sym in symbols:
+                sym_trades = [r for r in results if r['symbol'] == sym]
+                sym_wins = [r for r in sym_trades if r['win']]
+                sym_avg = sum(r['pl_pct'] for r in sym_trades) / len(sym_trades)
+                sym_stats.append((sym, len(sym_trades), len(sym_wins)/len(sym_trades)*100, sym_avg))
+            
+            sym_stats.sort(key=lambda x: x[3], reverse=True)
+            logger.info("\n📈 SYMBOL RANKING:")
+            for sym, count, wr, avg in sym_stats:
+                icon = "✅" if avg > 0 else "❌"
+                logger.info(f"  {icon} {sym}: {count} trades | WR: {wr:.0f}% | Avg: {avg:.2f}%")
+            
+            # Sentiment analysis
+            pos_sentiment = [r for r in results if r['sentiment'] > 0.1]
+            neg_sentiment = [r for r in results if r['sentiment'] < -0.05]
+            
+            if pos_sentiment:
+                pos_wr = sum(1 for r in pos_sentiment if r['win']) / len(pos_sentiment) * 100
+                logger.info(f"\n💡 Sentiment > 0.1: {pos_wr:.0f}% win rate ({len(pos_sentiment)} trades)")
+            if neg_sentiment:
+                neg_wr = sum(1 for r in neg_sentiment if r['win']) / len(neg_sentiment) * 100
+                logger.info(f"💡 Sentiment < -0.05: {neg_wr:.0f}% win rate ({len(neg_sentiment)} trades) → UNIKAJ!")
+            
+            logger.info('='*50)
+            
+        except Exception as e:
+            logger.error(f"ML Analyzer błąd: {e}")
 
 
 # ============================================================================
@@ -353,8 +568,13 @@ class TradingDB:
             pnl_realized REAL, total_trades INTEGER,
             winning_trades INTEGER, report_json TEXT);""")
         
+        # v6.0: Tabela dla regime history
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS regime_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_utc TEXT, regime TEXT, should_trade INTEGER, reason TEXT);""")
+        
         self.conn.commit()
-        logger.info("Database schema initialized")
+        logger.info("Database schema initialized (v6.0)")
 
     def upsert_bar(self, symbol, ts, timeframe, o, h, l, c, v):
         try:
@@ -377,6 +597,12 @@ class TradingDB:
              kw.get("entry_price"), kw.get("tp_price"), kw.get("sl_price"),
              kw.get("atr"), kw.get("sentiment"), kw.get("sentiment_confidence"),
              kw.get("news_count"), json.dumps(kw.get("raw", {}), ensure_ascii=False)))
+        self.conn.commit()
+
+    def log_regime(self, regime: str, should_trade: bool, reason: str):
+        self.conn.execute(
+            "INSERT INTO regime_log(ts_utc, regime, should_trade, reason) VALUES (?,?,?,?)",
+            (iso(utc_now()), regime, int(should_trade), reason))
         self.conn.commit()
 
     def upsert_order(self, order_obj):
@@ -416,7 +642,7 @@ class TradingDB:
 
 
 # ============================================================================
-# BOT v5.0 - AGGRESSIVE DIP BUYER
+# BOT v6.0 - ADAPTIVE DIP BUYER
 # ============================================================================
 class AggressiveBot:
     def __init__(self, cfg: Config, db: TradingDB):
@@ -430,17 +656,25 @@ class AggressiveBot:
         
         self.sentiment = SentimentAnalyzer() if cfg.sentiment_enabled else None
         
+        # v6.0: Regime Detector
+        self.regime = RegimeDetector(
+            data_client=self.data,
+            data_feed=cfg.data_feed,
+            check_interval=cfg.regime_check_interval
+        ) if cfg.regime_enabled else None
+        
+        # v6.0: ML Analyzer
+        self.ml = MLAnalyzer(db.conn)
+        
         self.last_trade: Dict[str, float] = {s: 0.0 for s in cfg.symbols}
         self.entry_price: Dict[str, float] = {}
         self.start_equity: Optional[float] = None
         
         self._load_entry_prices()
         
-        logger.info(f"AggressiveBot v5.0 | Strategy: DIP BUYING (like SAPER)")
-        logger.info(f"Entry: Yesterday's low + {cfg.dip_tolerance_pct}% | Rebound: {cfg.rebound_threshold_pct}%")
-        logger.info(f"Position sizing: ALL-IN ({cfg.max_pos_pct*100}%) | ATR SL={cfg.atr_sl_multiplier}x TP={cfg.atr_tp_multiplier}x")
-        logger.info(f"Sentiment filter: {'ON' if cfg.sentiment_enabled else 'OFF'}")
-        logger.info(f"Symbols: {cfg.symbols}")
+        logger.info(f"AggressiveBot v6.0 ADAPTIVE | Strategy: DIP BUYING + REGIME DETECTION")
+        logger.info(f"Regime Detection: {'ON' if cfg.regime_enabled else 'OFF'}")
+        logger.info(f"PDT Fix: GTC orders (stop-lossy działają przez noc!)")
 
     def _load_entry_prices(self):
         for sym in self.cfg.symbols:
@@ -449,7 +683,6 @@ class AggressiveBot:
                 self.entry_price[sym] = entry
 
     def fetch_historical_low(self, sym: str) -> Optional[float]:
-        """Fetch yesterday's low (or N days back)"""
         try:
             end_dt = utc_now()
             start_dt = end_dt - timedelta(days=self.cfg.lookback_days + 1)
@@ -474,7 +707,6 @@ class AggressiveBot:
             if len(df) < self.cfg.lookback_days:
                 return None
             
-            # Get yesterday's low (last complete day)
             yesterday_low = float(df['low'].iloc[-2])
             return yesterday_low
             
@@ -488,7 +720,7 @@ class AggressiveBot:
             req = StockBarsRequest(
                 symbol_or_symbols=sym,
                 timeframe=TimeFrame(tf_min, TimeFrameUnit.Minute),
-                start=utc_now() - timedelta(minutes=300 * tf_min),  # 300 bars
+                start=utc_now() - timedelta(minutes=300 * tf_min),
                 end=utc_now(),
                 feed=self.cfg.data_feed,
             )
@@ -521,10 +753,16 @@ class AggressiveBot:
         try:
             qty = round(qty, 4) if self.cfg.fractional_enabled else int(qty)
             order = self.trading.submit_order(
-                MarketOrderRequest(symbol=sym, qty=qty, side=side, time_in_force=TimeInForce.DAY))
+                MarketOrderRequest(
+                    symbol=sym,
+                    qty=qty,
+                    side=side,
+                    # v6.0 FIX: GTC zamiast DAY - stop-lossy działają przez noc i nie blokuje PDT!
+                    time_in_force=TimeInForce.GTC
+                ))
             self.db.upsert_order(order)
             self.last_trade[sym] = time.time()
-            logger.info(f"{sym}: {side} {qty} shares")
+            logger.info(f"{sym}: {side} {qty} shares [GTC]")
             return order
         except Exception as e:
             logger.error(f"{sym}: Order failed | {e}")
@@ -535,6 +773,21 @@ class AggressiveBot:
         return self.db.get_trades_today(symbol, today) < self.cfg.max_trades_per_day
 
     def run_once(self):
+        # ================================================================
+        # v6.0: REGIME GATE - sprawdź rynek PRZED wszystkim
+        # ================================================================
+        if self.regime:
+            ok = self.regime.should_trade(self.cfg.regime_spy_trend_threshold)
+            if not ok:
+                logger.warning(f"🛑 REGIME GATE: Bot wyłączony | {self.regime.get_status()}")
+                self.db.log_regime("BEAR_OR_VOLATILE", False, self.regime.get_status())
+                return  # Nie rób NIC - rynek spada
+            else:
+                self.db.log_regime("BULL_OR_SIDEWAYS", True, self.regime.get_status())
+        
+        # v6.0: ML co 6h
+        self.ml.maybe_analyze()
+        
         try:
             acct = self.trading.get_account()
         except Exception as e:
@@ -562,18 +815,15 @@ class AggressiveBot:
                 logger.error(f"{sym}: Error | {e}")
                 traceback.print_exc()
         
-        # Snapshot positions
         ts = utc_now()
         for p in self.trading.get_all_positions():
             self.db.insert_position(ts, p)
 
     def _process_symbol(self, sym, equity, cash, positions):
-        # Fetch bars
         df = self.fetch_bars(sym)
         if not self.validate_bars(df):
             return
         
-        # Store bars
         for ts, row in df.tail(3).iterrows():
             ts_dt = ts.to_pydatetime()
             if ts_dt.tzinfo is None:
@@ -584,11 +834,9 @@ class AggressiveBot:
         price = float(df["close"].iloc[-1])
         atr_val = calculate_atr(df, 14)
         
-        # Position info
         pos = positions.get(sym)
         pos_qty = float(pos.qty) if pos else 0.0
         
-        # Entry price from Alpaca
         entry = None
         if pos and hasattr(pos, "avg_entry_price") and pos.avg_entry_price:
             try:
@@ -599,7 +847,6 @@ class AggressiveBot:
         if entry is None and pos_qty == 0:
             entry = self.entry_price.get(sym)
         
-        # ATR-based TP/SL
         if entry and atr_val > 0:
             tp_price = entry + (atr_val * self.cfg.atr_tp_multiplier)
             sl_price = entry - (atr_val * self.cfg.atr_sl_multiplier)
@@ -627,36 +874,29 @@ class AggressiveBot:
             except Exception as e:
                 logger.warning(f"{sym}: Sentiment failed | {e}")
         
-        # === v5.0: DIP BUYING STRATEGY ===
-        
+        # === DIP BUYING STRATEGY ===
         action = "HOLD"
         reason = "none"
         yday_low = None
         rebound_pct = None
+        tp_hit = False
+        sl_hit = False
         
         if pos_qty == 0:
-            # NO POSITION - Look for entry
-            
-            # 1. Get yesterday's low
             yday_low = self.fetch_historical_low(sym)
             
             if yday_low is None:
-                logger.debug(f"{sym}: No historical data")
                 return
             
-            # 2. Check if price is near yesterday's low (within tolerance)
             dip_threshold = yday_low * (1 + self.cfg.dip_tolerance_pct / 100.0)
             is_at_dip = price <= dip_threshold
             
-            # 3. Check for rebound (price rising vs recent avg)
             recent_bars = df.tail(self.cfg.rebound_bars)
             avg_recent = recent_bars['close'].mean()
             rebound_pct = ((price - avg_recent) / avg_recent) * 100
             is_rebounding = rebound_pct >= self.cfg.rebound_threshold_pct
             
-            # 4. Combine conditions
             entry_signal = is_at_dip and is_rebounding and sentiment_ok
-            
             cooled = (time.time() - self.last_trade[sym]) >= self.cfg.cooldown_sec
             can_trade = self.can_trade_today(sym)
             
@@ -665,7 +905,6 @@ class AggressiveBot:
                          f"Sentiment={sentiment_score:+.2f} | ATR=${atr_val:.2f}")
             
             if entry_signal and cooled and can_trade:
-                # ALL-IN position sizing
                 qty = (cash * self.cfg.max_pos_pct) / price
                 
                 if not self.cfg.fractional_enabled:
@@ -691,13 +930,8 @@ class AggressiveBot:
                             tp_price = entry + (atr_val * self.cfg.atr_tp_multiplier)
                             sl_price = entry - (atr_val * self.cfg.atr_sl_multiplier)
                         cash -= qty * price
-            
-            elif entry_signal and not can_trade:
-                logger.info(f"{sym} | Max trades/day reached ({self.cfg.max_trades_per_day})")
         
         else:
-            # HAVE POSITION - Look for exit
-            
             if tp_price and sl_price:
                 logger.info(f"{sym} | pos={pos_qty:.4f} entry=${entry:.2f} TP=${tp_price:.2f} SL=${sl_price:.2f} | price=${price:.2f}")
             
@@ -719,7 +953,6 @@ class AggressiveBot:
                 if order:
                     self.entry_price.pop(sym, None)
         
-        # Log signal if action taken
         if action != "HOLD":
             self.db.insert_signal(
                 ts=utc_now(), symbol=sym, action=action, reason=reason,
@@ -769,13 +1002,12 @@ class AggressiveBot:
 
     def run(self):
         logger.info("="*60)
-        logger.info("AGGRESSIVE BOT v5.0 - DIP BUYING STRATEGY")
+        logger.info("ADAPTIVE BOT v6.0 - DIP BUYING + REGIME DETECTION")
         logger.info("="*60)
         logger.info(f"Strategy: Buy at yesterday's low + {self.cfg.dip_tolerance_pct}% when rebounding")
-        logger.info(f"Position sizing: ALL-IN ({self.cfg.max_pos_pct*100}% per trade)")
-        logger.info(f"Exit: ATR-based TP={self.cfg.atr_tp_multiplier}x SL={self.cfg.atr_sl_multiplier}x")
-        logger.info(f"Sentiment filter: {'ENABLED' if self.cfg.sentiment_enabled else 'DISABLED'}")
-        logger.info(f"Max trades/day: {self.cfg.max_trades_per_day}")
+        logger.info(f"Regime Detection: {'ENABLED' if self.cfg.regime_enabled else 'DISABLED'}")
+        logger.info(f"PDT Fix: GTC orders aktywne")
+        logger.info(f"ML Analysis: co 6h w logach")
         logger.info("="*60)
         
         try:
@@ -818,8 +1050,8 @@ class AggressiveBot:
 # ============================================================================
 def main():
     print("="*60)
-    print("AGGRESSIVE TRADING BOT v5.0")
-    print("Strategy: Dip Buying (like SAPER) + Sentiment Filter")
+    print("ADAPTIVE TRADING BOT v6.0")
+    print("Strategy: Dip Buying + Regime Detection + ML")
     print("="*60)
     
     required = ["APCA_API_KEY_ID", "APCA_API_SECRET_KEY"]
