@@ -642,6 +642,84 @@ class TradingDB:
 
 
 # ============================================================================
+# v6.0: GOOGLE SHEETS WEBHOOK (przez Apps Script - bez service account)
+# ============================================================================
+class SheetsWebhook:
+    """
+    Wysyła dane do Google Sheets przez Apps Script webhook.
+    Nie wymaga service account - tylko URL z deploymentu Apps Script.
+    
+    Ustaw zmienną: SHEETS_WEBHOOK_URL = "https://script.google.com/..."
+    """
+    
+    def __init__(self, webhook_url: str):
+        self.url = webhook_url
+        self.enabled = bool(webhook_url)
+        self.session = requests.Session()
+        self._last_regime = "UNKNOWN"
+    
+    def _send(self, data: dict) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            r = self.session.post(self.url, json=data, timeout=10)
+            return r.status_code == 200
+        except Exception as e:
+            logger.warning(f"Sheets webhook błąd: {e}")
+            return False
+    
+    def send_trade(self, symbol: str, action: str, price: float,
+                   entry_price: float = None, pl_pct: float = None,
+                   reason: str = "", atr: float = 0, sentiment: float = 0,
+                   rebound_pct: float = 0, yday_low: float = 0, equity: float = 0):
+        return self._send({
+            "type": "trade",
+            "timestamp": utc_now().isoformat(),
+            "symbol": symbol,
+            "action": action,
+            "price": price,
+            "entry_price": entry_price,
+            "pl_pct": pl_pct,
+            "reason": reason,
+            "atr": atr,
+            "sentiment": sentiment,
+            "rebound_pct": rebound_pct,
+            "yday_low": yday_low,
+            "equity": equity,
+            "regime": self._last_regime
+        })
+    
+    def send_regime(self, regime: str, should_trade: bool, reason: str, spy_trend: float = 0):
+        self._last_regime = regime
+        return self._send({
+            "type": "regime",
+            "timestamp": utc_now().isoformat(),
+            "regime": regime,
+            "should_trade": should_trade,
+            "reason": reason,
+            "spy_trend": spy_trend
+        })
+    
+    def send_summary(self, date: str, start_equity: float, end_equity: float,
+                     total_trades: int, winning_trades: int):
+        pnl = end_equity - start_equity
+        pnl_pct = round(pnl / start_equity * 100, 2) if start_equity > 0 else 0
+        win_rate = round(winning_trades / total_trades * 100, 1) if total_trades > 0 else 0
+        return self._send({
+            "type": "summary",
+            "date": date,
+            "start_equity": round(start_equity, 2),
+            "end_equity": round(end_equity, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": pnl_pct,
+            "total_trades": total_trades,
+            "winning_trades": winning_trades,
+            "win_rate": win_rate,
+            "regime": self._last_regime
+        })
+
+
+# ============================================================================
 # BOT v6.0 - ADAPTIVE DIP BUYER
 # ============================================================================
 class AggressiveBot:
@@ -666,6 +744,9 @@ class AggressiveBot:
         # v6.0: ML Analyzer
         self.ml = MLAnalyzer(db.conn)
         
+        # v6.0: Google Sheets Webhook
+        self.sheets = SheetsWebhook(os.getenv("SHEETS_WEBHOOK_URL", ""))
+        
         self.last_trade: Dict[str, float] = {s: 0.0 for s in cfg.symbols}
         self.entry_price: Dict[str, float] = {}
         self.start_equity: Optional[float] = None
@@ -684,8 +765,9 @@ class AggressiveBot:
 
     def fetch_historical_low(self, sym: str) -> Optional[float]:
         try:
+            # Pobierz więcej dni żeby mieć pewność danych (weekend = brak sesji)
             end_dt = utc_now()
-            start_dt = end_dt - timedelta(days=self.cfg.lookback_days + 1)
+            start_dt = end_dt - timedelta(days=7)  # ostatnie 7 dni, znajdziemy ostatnią sesję
             
             req = StockBarsRequest(
                 symbol_or_symbols=sym,
@@ -698,18 +780,27 @@ class AggressiveBot:
             df = self.data.get_stock_bars(req).df
             
             if df is None or len(df) == 0:
+                logger.warning(f"{sym}: Brak danych historycznych")
                 return None
             
             if isinstance(df.index, pd.MultiIndex):
                 df = df.reset_index()
                 df = df[df["symbol"] == sym].set_index("timestamp")
             
-            if len(df) < self.cfg.lookback_days:
-                return None
+            df = df.sort_index()
             
+            # Potrzebujemy minimum 2 bary (dziś + wczoraj)
+            if len(df) < 2:
+                logger.warning(f"{sym}: Za mało barów ({len(df)}) - używam dostępnego minimum")
+                return float(df['low'].iloc[-1])
+            
+            # iloc[-1] = dzisiaj (lub ostatnia sesja), iloc[-2] = wczoraj
             yesterday_low = float(df['low'].iloc[-2])
             return yesterday_low
             
+        except IndexError as e:
+            logger.warning(f"{sym}: IndexError w fetch_historical_low - za mało danych")
+            return None
         except Exception as e:
             logger.error(f"Failed to fetch historical data for {sym}: {e}")
             return None
@@ -751,18 +842,20 @@ class AggressiveBot:
         if qty <= 0 or (self.cfg.fractional_enabled and qty < 0.01):
             return None
         try:
+            # Alpaca wymaga DAY dla fractional shares
+            # PDT rozwiązujemy przez całkowite unikanie day-tradingu (Regime Detector)
             qty = round(qty, 4) if self.cfg.fractional_enabled else int(qty)
+            tif = TimeInForce.DAY if self.cfg.fractional_enabled else TimeInForce.GTC
             order = self.trading.submit_order(
                 MarketOrderRequest(
                     symbol=sym,
                     qty=qty,
                     side=side,
-                    # v6.0 FIX: GTC zamiast DAY - stop-lossy działają przez noc i nie blokuje PDT!
-                    time_in_force=TimeInForce.GTC
+                    time_in_force=tif
                 ))
             self.db.upsert_order(order)
             self.last_trade[sym] = time.time()
-            logger.info(f"{sym}: {side} {qty} shares [GTC]")
+            logger.info(f"{sym}: {side} {qty} shares [{tif}]")
             return order
         except Exception as e:
             logger.error(f"{sym}: Order failed | {e}")
@@ -776,14 +869,17 @@ class AggressiveBot:
         # ================================================================
         # v6.0: REGIME GATE - sprawdź rynek PRZED wszystkim
         # ================================================================
+        regime_ok = True
         if self.regime:
-            ok = self.regime.should_trade(self.cfg.regime_spy_trend_threshold)
-            if not ok:
-                logger.warning(f"🛑 REGIME GATE: Bot wyłączony | {self.regime.get_status()}")
+            regime_ok = self.regime.should_trade(self.cfg.regime_spy_trend_threshold)
+            if not regime_ok:
+                logger.warning(f"🛑 REGIME GATE: Brak nowych BUY | {self.regime.get_status()}")
                 self.db.log_regime("BEAR_OR_VOLATILE", False, self.regime.get_status())
-                return  # Nie rób NIC - rynek spada
+                self.sheets.send_regime("BEAR_OR_VOLATILE", False, self.regime.get_status())
+                # NIE wychodzimy! Sprawdzamy czy są otwarte pozycje do zamknięcia
             else:
                 self.db.log_regime("BULL_OR_SIDEWAYS", True, self.regime.get_status())
+                self.sheets.send_regime("BULL_OR_SIDEWAYS", True, self.regime.get_status())
         
         # v6.0: ML co 6h
         self.ml.maybe_analyze()
@@ -810,7 +906,7 @@ class AggressiveBot:
         
         for sym in self.cfg.symbols:
             try:
-                self._process_symbol(sym, equity, cash, positions)
+                self._process_symbol(sym, equity, cash, positions, allow_buy=regime_ok)
             except Exception as e:
                 logger.error(f"{sym}: Error | {e}")
                 traceback.print_exc()
@@ -819,7 +915,7 @@ class AggressiveBot:
         for p in self.trading.get_all_positions():
             self.db.insert_position(ts, p)
 
-    def _process_symbol(self, sym, equity, cash, positions):
+    def _process_symbol(self, sym, equity, cash, positions, allow_buy=True):
         df = self.fetch_bars(sym)
         if not self.validate_bars(df):
             return
@@ -904,7 +1000,10 @@ class AggressiveBot:
                          f"Dip={'YES' if is_at_dip else 'NO'} Rebound={rebound_pct:+.2f}% | "
                          f"Sentiment={sentiment_score:+.2f} | ATR=${atr_val:.2f}")
             
-            if entry_signal and cooled and can_trade:
+            if not allow_buy and entry_signal:
+                logger.info(f"{sym} | 🛑 BEAR MARKET - pomijam BUY mimo sygnału")
+            
+            if entry_signal and cooled and can_trade and allow_buy:
                 qty = (cash * self.cfg.max_pos_pct) / price
                 
                 if not self.cfg.fractional_enabled:
@@ -930,6 +1029,12 @@ class AggressiveBot:
                             tp_price = entry + (atr_val * self.cfg.atr_tp_multiplier)
                             sl_price = entry - (atr_val * self.cfg.atr_sl_multiplier)
                         cash -= qty * price
+                        # v6.0: Wyślij do Google Sheets
+                        self.sheets.send_trade(
+                            symbol=sym, action="BUY", price=price,
+                            entry_price=price, pl_pct=None, reason=reason,
+                            atr=atr_val, sentiment=sentiment_score,
+                            rebound_pct=rebound_pct, yday_low=yday_low or 0, equity=equity)
         
         else:
             if tp_price and sl_price:
@@ -952,6 +1057,12 @@ class AggressiveBot:
                 
                 if order:
                     self.entry_price.pop(sym, None)
+                    # v6.0: Wyślij do Google Sheets
+                    self.sheets.send_trade(
+                        symbol=sym, action="SELL", price=price,
+                        entry_price=entry, pl_pct=pnl_pct, reason=reason,
+                        atr=atr_val, sentiment=sentiment_score,
+                        rebound_pct=rebound_pct or 0, yday_low=yday_low or 0, equity=equity)
         
         if action != "HOLD":
             self.db.insert_signal(
@@ -998,6 +1109,8 @@ class AggressiveBot:
         logger.info(f"\n{'='*60}\nEOD REPORT {today}\n{'='*60}\n"
                      f"Start: ${start_equity:,.2f} | End: ${end_equity:,.2f} | P/L: ${pnl:+,.2f} ({report['pnl_pct']:+.2f}%)\n"
                      f"Trades: {total} | Wins: {wins} | Rate: {report['win_rate']:.1f}%\n{'='*60}")
+        # v6.0: Wyślij summary do Google Sheets
+        self.sheets.send_summary(today, start_equity, end_equity, total, wins)
         return report
 
     def run(self):
