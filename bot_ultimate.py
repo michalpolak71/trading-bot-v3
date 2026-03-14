@@ -95,6 +95,11 @@ class Config:
     regime_enabled: bool
     regime_check_interval: int   # sekundy między sprawdzeniami (domyślnie 3600 = 1h)
     regime_spy_trend_threshold: float  # % spadku SPY w 5 dni żeby wyłączyć bota
+
+    # v7.0: Market Analyzer (Claude AI)
+    market_analysis_enabled: bool
+    market_analysis_interval: int    # sekundy między analizami (domyślnie 1800 = 30 min)
+    trailing_stop_pct: float         # % trailing stop gdy DIP (domyślnie 3.0)
     
     # Data
     db_path: str
@@ -135,6 +140,11 @@ def load_config() -> Config:
         regime_enabled=os.getenv("REGIME_ENABLED", "true").lower() == "true",
         regime_check_interval=int(os.getenv("REGIME_CHECK_INTERVAL", "3600")),
         regime_spy_trend_threshold=float(os.getenv("REGIME_SPY_THRESHOLD", "-2.0")),
+
+        # v7.0: Market Analyzer
+        market_analysis_enabled=os.getenv("MARKET_ANALYSIS_ENABLED", "true").lower() == "true",
+        market_analysis_interval=int(os.getenv("MARKET_ANALYSIS_INTERVAL", "1800")),
+        trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "3.0")),
         
         db_path=os.getenv("DB_PATH", "bot_ultimate.db"),
         data_feed=os.getenv("DATA_FEED", "iex").lower(),
@@ -184,6 +194,225 @@ def can_trade_now() -> bool:
     now_ny = datetime.now(tz_ny)
     trade_start = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
     return now_ny >= trade_start
+
+
+
+# ============================================================================
+# v7.0: MARKET ANALYZER — Claude AI ocenia czy spadek to dip czy krach
+# ============================================================================
+class MarketAnalyzer:
+    """
+    Łączy dane techniczne SPY z analizą Claude AI.
+    
+    Tryby pozycji (position_mode):
+      DIP       → chwilowy spadek, trzymaj pozycję z trailing stopem
+      CRASH     → silny trend spadkowy, sprzedaj pozycje na minusie
+      UNKNOWN   → brak danych, zachowaj się jak przy DIP (ostrożnie)
+    
+    Analiza co MARKET_ANALYSIS_INTERVAL sekund (domyślnie 1800 = 30 min).
+    """
+
+    MODE_DIP   = "DIP"
+    MODE_CRASH = "CRASH"
+    MODE_UNKNOWN = "UNKNOWN"
+
+    def __init__(self, data_client, data_feed: str = "iex",
+                 check_interval: int = 1800, anthropic_key: str = ""):
+        self.data_client   = data_client
+        self.data_feed     = data_feed
+        self.check_interval = check_interval
+        self.anthropic_key = anthropic_key
+        self.enabled       = bool(anthropic_key)
+
+        self._mode         = self.MODE_UNKNOWN
+        self._reasoning    = "Brak analizy"
+        self._last_check   = 0
+        self._trailing_sl: Dict[str, float] = {}   # sym → aktualny trailing SL
+
+    # ------------------------------------------------------------------
+    # Dane techniczne SPY
+    # ------------------------------------------------------------------
+    def _get_spy_data(self) -> dict:
+        """Zbiera wskaźniki SPY: ceny, EMA20/50, RSI14, zmiana 1d/5d/20d."""
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols="SPY",
+                timeframe=TimeFrame(1, TimeFrameUnit.Day),
+                start=utc_now() - timedelta(days=70),
+                end=utc_now(),
+                feed=self.data_feed
+            )
+            df = self.data_client.get_stock_bars(req).df
+            if df is None or df.empty:
+                return {}
+
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.reset_index()
+                df = df[df["symbol"] == "SPY"].set_index("timestamp")
+            df = df.sort_index()
+
+            closes = df["close"].tolist()
+            volumes = df["volume"].tolist()
+            if len(closes) < 20:
+                return {}
+
+            def ema(prices, span):
+                k = 2 / (span + 1)
+                e = prices[0]
+                for p in prices[1:]:
+                    e = p * k + e * (1 - k)
+                return e
+
+            # RSI 14
+            deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+            gains  = [max(d, 0) for d in deltas[-14:]]
+            losses = [abs(min(d, 0)) for d in deltas[-14:]]
+            avg_g  = sum(gains) / 14 if gains else 0
+            avg_l  = sum(losses) / 14 if losses else 1
+            rsi    = 100 - (100 / (1 + avg_g / avg_l)) if avg_l > 0 else 50
+
+            current = closes[-1]
+            vol_avg5  = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else 0
+            vol_avg20 = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1
+
+            return {
+                "current_price": round(current, 2),
+                "ema20":  round(ema(closes[-20:], 20), 2),
+                "ema50":  round(ema(closes[-50:] if len(closes) >= 50 else closes, 50), 2),
+                "rsi14":  round(rsi, 1),
+                "change_1d":  round((closes[-1] - closes[-2]) / closes[-2] * 100, 2) if len(closes) >= 2 else 0,
+                "change_5d":  round((closes[-1] - closes[-6]) / closes[-6] * 100, 2) if len(closes) >= 6 else 0,
+                "change_20d": round((closes[-1] - closes[-21]) / closes[-21] * 100, 2) if len(closes) >= 21 else 0,
+                "volume_ratio": round(vol_avg5 / vol_avg20, 2) if vol_avg20 > 0 else 1.0,
+                "bars_count": len(closes),
+            }
+        except Exception as e:
+            logger.error(f"MarketAnalyzer: błąd danych SPY: {e}")
+            return {}
+
+    # ------------------------------------------------------------------
+    # Zapytaj Claude AI
+    # ------------------------------------------------------------------
+    def _ask_claude(self, spy: dict) -> tuple:
+        """
+        Pyta Claude AI o ocenę sytuacji rynkowej.
+        Zwraca (mode: str, reasoning: str).
+        """
+        if not self.anthropic_key:
+            return self.MODE_UNKNOWN, "Brak klucza Anthropic API"
+
+        prompt = f"""Jesteś ekspertem analizy technicznej giełdy USA. 
+Przeanalizuj poniższe dane SPY (S&P 500 ETF) i oceń czy obecny spadek to:
+- DIP (chwilowa korekta, warto trzymać pozycje i czekać na odbicie)
+- CRASH (silny trend spadkowy, należy zamknąć stratne pozycje)
+
+Dane SPY:
+- Cena aktualna: ${spy.get('current_price')}
+- EMA20: {spy.get('ema20')} | EMA50: {spy.get('ema50')}
+- RSI14: {spy.get('rsi14')}
+- Zmiana 1 dzień: {spy.get('change_1d')}%
+- Zmiana 5 dni: {spy.get('change_5d')}%
+- Zmiana 20 dni: {spy.get('change_20d')}%
+- Wolumen (ratio 5d/20d avg): {spy.get('volume_ratio')}x
+
+Odpowiedz DOKŁADNIE w tym formacie JSON (nic poza JSON):
+{{"mode": "DIP" lub "CRASH", "confidence": 0-100, "reasoning": "krótkie uzasadnienie po polsku max 2 zdania"}}"""
+
+        try:
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": self.anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 200,
+                    "messages": [{"role": "user", "content": prompt}]
+                },
+                timeout=15
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            text = data["content"][0]["text"].strip()
+
+            # Usuń ewentualne markdown backticki
+            text = text.replace("```json", "").replace("```", "").strip()
+            result = json.loads(text)
+
+            mode      = result.get("mode", self.MODE_UNKNOWN).upper()
+            confidence = result.get("confidence", 50)
+            reasoning = result.get("reasoning", "brak uzasadnienia")
+
+            if mode not in (self.MODE_DIP, self.MODE_CRASH):
+                mode = self.MODE_UNKNOWN
+
+            return mode, f"[{confidence}% pewności] {reasoning}"
+
+        except Exception as e:
+            logger.error(f"MarketAnalyzer: błąd Claude API: {e}")
+            return self.MODE_UNKNOWN, f"Błąd API: {e}"
+
+    # ------------------------------------------------------------------
+    # Główna metoda — wywołaj co 30 min
+    # ------------------------------------------------------------------
+    def analyze(self) -> str:
+        """Zwraca aktualny tryb: DIP / CRASH / UNKNOWN. Używa cache."""
+        now = time.time()
+        if (now - self._last_check) < self.check_interval and self._mode != self.MODE_UNKNOWN:
+            return self._mode
+
+        spy = self._get_spy_data()
+        if not spy:
+            logger.warning("MarketAnalyzer: brak danych SPY — tryb UNKNOWN")
+            self._mode = self.MODE_UNKNOWN
+            self._reasoning = "Brak danych SPY"
+            self._last_check = now
+            return self._mode
+
+        mode, reasoning = self._ask_claude(spy)
+        self._mode      = mode
+        self._reasoning = reasoning
+        self._last_check = now
+
+        emoji = "📉" if mode == self.MODE_CRASH else "🔄" if mode == self.MODE_DIP else "❓"
+        logger.info(
+            f"MarketAnalyzer {emoji} {mode} | "
+            f"SPY={spy['current_price']} RSI={spy['rsi14']} "
+            f"5d={spy['change_5d']}% EMA20/50={spy['ema20']}/{spy['ema50']} | "
+            f"{reasoning}"
+        )
+        return self._mode
+
+    # ------------------------------------------------------------------
+    # Trailing Stop
+    # ------------------------------------------------------------------
+    def update_trailing_sl(self, sym: str, price: float, entry: float,
+                           trail_pct: float = 3.0) -> float:
+        """
+        Przesuwa SL w górę gdy cena rośnie (trailing stop).
+        SL nigdy nie idzie w dół.
+        Zwraca aktualny SL.
+        """
+        min_sl  = entry * (1 - trail_pct / 100)   # nigdy nie przekrocz straty od entry
+        new_sl  = price * (1 - trail_pct / 100)
+
+        current = self._trailing_sl.get(sym, min_sl)
+        updated = max(current, new_sl, min_sl)
+        self._trailing_sl[sym] = updated
+        return updated
+
+    def get_trailing_sl(self, sym: str, entry: float, trail_pct: float = 3.0) -> float:
+        """Zwraca aktualny trailing SL dla symbolu (lub domyślny od entry)."""
+        return self._trailing_sl.get(sym, entry * (1 - trail_pct / 100))
+
+    def reset_trailing_sl(self, sym: str):
+        """Usuń trailing SL po sprzedaży pozycji."""
+        self._trailing_sl.pop(sym, None)
+
+    def get_status(self) -> str:
+        return f"{self._mode}: {self._reasoning}"
 
 
 # ============================================================================
@@ -640,6 +869,15 @@ class TradingDB:
         row = cur.fetchone()
         return int(row[0]) if row else 0
 
+    def bought_today(self, symbol: str) -> bool:
+        """Czy kupiłem ten symbol DZIŚ? Jeśli tak, SELL = PDT violation."""
+        today = utc_now().strftime("%Y-%m-%d")
+        cur = self.conn.execute(
+            "SELECT COUNT(*) FROM signals WHERE symbol=? AND action='BUY' AND DATE(ts_utc)=?",
+            (symbol, today))
+        row = cur.fetchone()
+        return int(row[0]) > 0 if row else False
+
 
 # ============================================================================
 # v6.0: GOOGLE SHEETS WEBHOOK (przez Apps Script - bez service account)
@@ -740,6 +978,14 @@ class AggressiveBot:
             data_feed=cfg.data_feed,
             check_interval=cfg.regime_check_interval
         ) if cfg.regime_enabled else None
+
+        # v7.0: Market Analyzer (Claude AI — DIP vs CRASH)
+        self.market_analyzer = MarketAnalyzer(
+            data_client=self.data,
+            data_feed=cfg.data_feed,
+            check_interval=cfg.market_analysis_interval,
+            anthropic_key=os.getenv("ANTHROPIC_API_KEY", "")
+        ) if cfg.market_analysis_enabled else None
         
         # v6.0: ML Analyzer
         self.ml = MLAnalyzer(db.conn)
@@ -1037,27 +1283,74 @@ class AggressiveBot:
                             rebound_pct=rebound_pct, yday_low=yday_low or 0, equity=equity)
         
         else:
-            if tp_price and sl_price:
-                logger.info(f"{sym} | pos={pos_qty:.4f} entry=${entry:.2f} TP=${tp_price:.2f} SL=${sl_price:.2f} | price=${price:.2f}")
-            
+            # ----------------------------------------------------------------
+            # v7.0: Pobierz ocenę rynku od Claude AI (DIP vs CRASH)
+            # ----------------------------------------------------------------
+            market_mode = MarketAnalyzer.MODE_UNKNOWN
+            if self.market_analyzer:
+                market_mode = self.market_analyzer.analyze()
+
+            # ----------------------------------------------------------------
+            # v7.0: Trailing stop (aktualizuj gdy cena rośnie)
+            # ----------------------------------------------------------------
+            if self.market_analyzer and entry:
+                effective_sl = self.market_analyzer.update_trailing_sl(
+                    sym, price, entry, self.cfg.trailing_stop_pct)
+            else:
+                effective_sl = sl_price  # fallback: ATR-based SL
+
+            if tp_price and effective_sl:
+                logger.info(
+                    f"{sym} | pos={pos_qty:.4f} entry=${entry:.2f} "
+                    f"TP=${tp_price:.2f} SL=${effective_sl:.2f} (trailing) | "
+                    f"price=${price:.2f} | market={market_mode}")
+
             tp_hit = (tp_price is not None and price >= tp_price)
-            sl_hit = (sl_price is not None and price <= sl_price)
             cooled = (time.time() - self.last_trade[sym]) >= self.cfg.cooldown_sec
-            
-            if (tp_hit or sl_hit) and cooled:
+
+            # ----------------------------------------------------------------
+            # SL zależy od trybu rynku:
+            # DIP     → trailing SL (szerszy, daje szansę na odbicie)
+            # CRASH   → trailing SL + sprzedaj jeśli jesteś na minusie
+            # UNKNOWN → trailing SL (zachowaj się jak DIP)
+            # ----------------------------------------------------------------
+            pnl_now = ((price - entry) / entry * 100) if entry else 0
+            sl_hit = (effective_sl is not None and price <= effective_sl)
+
+            if market_mode == MarketAnalyzer.MODE_CRASH and pnl_now < 0:
+                # KRACH: sprzedaj wszystkie pozycje na stracie
+                if not sl_hit:
+                    sl_hit = True
+                    logger.warning(
+                        f"{sym} | 📉 CRASH MODE — sprzedaję stratną pozycję "
+                        f"P/L: {pnl_now:+.2f}%")
+
+            # PDT PROTECTION: Nie sprzedawaj tego samego dnia co kupiłeś
+            pdt_block = self.db.bought_today(sym)
+            if pdt_block and (tp_hit or sl_hit):
+                logger.info(
+                    f"{sym} | ⏳ PDT HOLD - kupione dziś, czekam do jutra | "
+                    f"P/L: {pnl_now:+.2f}% | market={market_mode}")
+
+            if (tp_hit or sl_hit) and cooled and not pdt_block:
                 action = "SELL"
                 reason = "take_profit" if tp_hit else "stop_loss"
-                
+                if market_mode == MarketAnalyzer.MODE_CRASH and pnl_now < 0:
+                    reason = "crash_exit"
+
                 qty = pos_qty if self.cfg.fractional_enabled else int(pos_qty)
-                pnl_pct = ((price - entry) / entry * 100) if entry else 0
-                
-                logger.info(f"{sym} | 💥 SELL {qty:.4f} @${price:.2f} | {reason} | P/L: {pnl_pct:+.2f}%")
-                
+                pnl_pct = pnl_now
+
+                logger.info(
+                    f"{sym} | 💥 SELL {qty:.4f} @${price:.2f} | "
+                    f"{reason} | P/L: {pnl_pct:+.2f}% | market={market_mode}")
+
                 order = self.submit_order(sym, OrderSide.SELL, qty)
-                
+
                 if order:
                     self.entry_price.pop(sym, None)
-                    # v6.0: Wyślij do Google Sheets
+                    if self.market_analyzer:
+                        self.market_analyzer.reset_trailing_sl(sym)
                     self.sheets.send_trade(
                         symbol=sym, action="SELL", price=price,
                         entry_price=entry, pl_pct=pnl_pct, reason=reason,
