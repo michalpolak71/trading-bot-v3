@@ -100,7 +100,7 @@ class Config:
     sentiment_enabled: bool
     sentiment_min_threshold: float
     
-    # v6.0: Regime Detection
+    # v7.0: Regime Detection
     regime_enabled: bool
     regime_check_interval: int   # sekundy między sprawdzeniami (domyślnie 3600 = 1h)
     regime_spy_trend_threshold: float  # % spadku SPY w 5 dni żeby wyłączyć bota
@@ -146,7 +146,7 @@ def load_config() -> Config:
         sentiment_enabled=os.getenv("SENTIMENT_ENABLED", "true").lower() == "true",
         sentiment_min_threshold=float(os.getenv("SENTIMENT_MIN_THRESHOLD", "-0.5")),
         
-        # v6.0: Regime Detection
+        # v7.0: Regime Detection
         regime_enabled=os.getenv("REGIME_ENABLED", "true").lower() == "true",
         regime_check_interval=int(os.getenv("REGIME_CHECK_INTERVAL", "3600")),
         regime_spy_trend_threshold=float(os.getenv("REGIME_SPY_THRESHOLD", "-2.0")),
@@ -449,7 +449,7 @@ Odpowiedz DOKŁADNIE w tym formacie JSON (nic poza JSON):
 
 
 # ============================================================================
-# v6.0: REGIME DETECTOR (wbudowany - bez zewnętrznych plików)
+# v7.0: REGIME DETECTOR (wbudowany - bez zewnętrznych plików)
 # ============================================================================
 class RegimeDetector:
     """
@@ -574,7 +574,7 @@ class RegimeDetector:
 
 
 # ============================================================================
-# v6.0: ML ANALYZER (wbudowany)
+# v7.0: ML ANALYZER (wbudowany)
 # ============================================================================
 class MLAnalyzer:
     """
@@ -830,13 +830,13 @@ class TradingDB:
             pnl_realized REAL, total_trades INTEGER,
             winning_trades INTEGER, report_json TEXT);""")
         
-        # v6.0: Tabela dla regime history
+        # v7.0: Tabela dla regime history
         self.conn.execute("""CREATE TABLE IF NOT EXISTS regime_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts_utc TEXT, regime TEXT, should_trade INTEGER, reason TEXT);""")
         
         self.conn.commit()
-        logger.info("Database schema initialized (v6.0)")
+        logger.info("Database schema initialized (v7.0)")
 
     def upsert_bar(self, symbol, ts, timeframe, o, h, l, c, v):
         try:
@@ -913,7 +913,7 @@ class TradingDB:
 
 
 # ============================================================================
-# v6.0: GOOGLE SHEETS WEBHOOK (przez Apps Script - bez service account)
+# v7.0: GOOGLE SHEETS WEBHOOK (przez Apps Script - bez service account)
 # ============================================================================
 class SheetsWebhook:
     """
@@ -991,7 +991,7 @@ class SheetsWebhook:
 
 
 # ============================================================================
-# BOT v6.0 - ADAPTIVE DIP BUYER
+# BOT v7.0 - ADAPTIVE DIP BUYER + CLAUDE AI
 # ============================================================================
 class AggressiveBot:
     def __init__(self, cfg: Config, db: TradingDB):
@@ -1005,7 +1005,7 @@ class AggressiveBot:
         
         self.sentiment = SentimentAnalyzer() if cfg.sentiment_enabled else None
         
-        # v6.0: Regime Detector
+        # v7.0: Regime Detector
         self.regime = RegimeDetector(
             data_client=self.data,
             data_feed=cfg.data_feed,
@@ -1020,10 +1020,10 @@ class AggressiveBot:
             anthropic_key=os.getenv("ANTHROPIC_API_KEY", "")
         ) if cfg.market_analysis_enabled else None
         
-        # v6.0: ML Analyzer
+        # v7.0: ML Analyzer
         self.ml = MLAnalyzer(db.conn)
         
-        # v6.0: Google Sheets Webhook
+        # v7.0: Google Sheets Webhook
         self.sheets = SheetsWebhook(os.getenv("SHEETS_WEBHOOK_URL", ""))
         
         self.last_trade: Dict[str, float] = {s: 0.0 for s in cfg.symbols}
@@ -1032,7 +1032,7 @@ class AggressiveBot:
         
         self._load_entry_prices()
         
-        logger.info(f"AggressiveBot v6.0 ADAPTIVE | Strategy: DIP BUYING + REGIME DETECTION")
+        logger.info(f"AggressiveBot v7.0 ADAPTIVE | Strategy: DIP BUYING + REGIME DETECTION + CLAUDE AI")
         logger.info(f"Regime Detection: {'ON' if cfg.regime_enabled else 'OFF'}")
         logger.info(f"PDT Fix: GTC orders (stop-lossy działają przez noc!)")
 
@@ -1146,7 +1146,7 @@ class AggressiveBot:
 
     def run_once(self):
         # ================================================================
-        # v6.0: REGIME GATE - sprawdź rynek PRZED wszystkim
+        # v7.0: REGIME GATE - sprawdź rynek PRZED wszystkim
         # ================================================================
         regime_ok = True
         if self.regime:
@@ -1160,7 +1160,7 @@ class AggressiveBot:
                 self.db.log_regime("BULL_OR_SIDEWAYS", True, self.regime.get_status())
                 self.sheets.send_regime("BULL_OR_SIDEWAYS", True, self.regime.get_status())
         
-        # v6.0: ML co 6h
+        # v7.0: ML co 6h
         self.ml.maybe_analyze()
         
         try:
@@ -1466,13 +1466,13 @@ class AggressiveBot:
         logger.info(f"\n{'='*60}\nEOD REPORT {today}\n{'='*60}\n"
                      f"Start: ${start_equity:,.2f} | End: ${end_equity:,.2f} | P/L: ${pnl:+,.2f} ({report['pnl_pct']:+.2f}%)\n"
                      f"Trades: {total} | Wins: {wins} | Rate: {report['win_rate']:.1f}%\n{'='*60}")
-        # v6.0: Wyślij summary do Google Sheets
+        # v7.0: Wyślij summary do Google Sheets
         self.sheets.send_summary(today, start_equity, end_equity, total, wins)
         return report
 
     def run(self):
         logger.info("="*60)
-        logger.info("ADAPTIVE BOT v6.0 - DIP BUYING + REGIME DETECTION")
+        logger.info("ADAPTIVE BOT v7.0 - DIP BUYING + REGIME DETECTION + CLAUDE AI")
         logger.info("="*60)
         logger.info(f"Strategy: Buy at yesterday's low + {self.cfg.dip_tolerance_pct}% when rebounding")
         logger.info(f"Regime Detection: {'ENABLED' if self.cfg.regime_enabled else 'DISABLED'}")
@@ -1520,7 +1520,7 @@ class AggressiveBot:
 # ============================================================================
 def main():
     print("="*60)
-    print("ADAPTIVE TRADING BOT v6.0")
+    print("ADAPTIVE TRADING BOT v7.0")
     print("Strategy: Dip Buying + Regime Detection + ML")
     print("="*60)
     
