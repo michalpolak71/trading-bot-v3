@@ -1,12 +1,21 @@
-# bot_ultimate.py — ULTIMATE TRADING BOT v6.0 ADAPTIVE
-# Strategy: Yesterday's Low + Rebound (like SAPER bot) + Sentiment Filter + Regime Detection
-# 100% AGGRESSIVE - No safe guards, maximum profit potential
+# bot_ultimate.py — ULTIMATE TRADING BOT v7.0 ADAPTIVE
+# Strategy: Yesterday's Low + Rebound + Sentiment + Regime Detection + Claude AI Market Analysis
 #
+# ============================================================================
+# v7.0 CHANGES (Mar 2026):
+# ============================================================================
+#   ✅ MARKET ANALYZER — Claude AI ocenia DIP vs CRASH co 30 min
+#   ✅ CRASH BUYING — mała pozycja (30%) gdy RSI<32 + wolumen maleje
+#   ✅ TRAILING STOP — SL przesuwa się w górę za ceną (nigdy w dół)
+#   ✅ CRASH EXIT — sprzedaj stratne pozycje gdy Claude wykryje krach
+#   ✅ PDT PROTECTION — nie sprzedawaj akcji kupionych tego samego dnia
+#   ✅ HISTORICAL FIX — pobiera 7 dni wstecz (fix weekendy/święta)
+#   ✅ REGIME GATE — blokuje BUY w BEAR, pozwala SELL (fix z v6.0)
 # ============================================================================
 # v6.0 CHANGES (Mar 2026):
 # ============================================================================
 #   ✅ REGIME DETECTION - bot wyłącza się w BEAR market (fix straty 27.02!)
-#   ✅ PDT FIX - zmiana TimeInForce.DAY → GTC (stop-lossy działają!)
+#   ✅ PDT FIX - zmiana TimeInForce.DAY dla fractional shares
 #   ✅ ML ANALYZER - zapisuje i analizuje wyniki trades
 #   ✅ Wszystkie zmiany WEWNĄTRZ tego pliku (zero nowych plików)
 # ============================================================================
@@ -100,6 +109,7 @@ class Config:
     market_analysis_enabled: bool
     market_analysis_interval: int    # sekundy między analizami (domyślnie 1800 = 30 min)
     trailing_stop_pct: float         # % trailing stop gdy DIP (domyślnie 3.0)
+    crash_buy_pct: float             # % kapitału przy crash-buying (domyślnie 0.30)
     
     # Data
     db_path: str
@@ -145,6 +155,7 @@ def load_config() -> Config:
         market_analysis_enabled=os.getenv("MARKET_ANALYSIS_ENABLED", "true").lower() == "true",
         market_analysis_interval=int(os.getenv("MARKET_ANALYSIS_INTERVAL", "1800")),
         trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "3.0")),
+        crash_buy_pct=float(os.getenv("CRASH_BUY_PCT", "0.30")),
         
         db_path=os.getenv("DB_PATH", "bot_ultimate.db"),
         data_feed=os.getenv("DATA_FEED", "iex").lower(),
@@ -226,6 +237,7 @@ class MarketAnalyzer:
 
         self._mode         = self.MODE_UNKNOWN
         self._reasoning    = "Brak analizy"
+        self._buy_signal   = False   # Claude mówi: teraz dobry moment na zakup?
         self._last_check   = 0
         self._trailing_sl: Dict[str, float] = {}   # sym → aktualny trailing SL
 
@@ -275,6 +287,9 @@ class MarketAnalyzer:
             vol_avg5  = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else 0
             vol_avg20 = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1
 
+            # Wolumen ostatnich 3 vs poprzednich 3 dni (trend wolumenu)
+            vol_trend = round(sum(volumes[-3:]) / sum(volumes[-6:-3]), 2) if len(volumes) >= 6 and sum(volumes[-6:-3]) > 0 else 1.0
+
             return {
                 "current_price": round(current, 2),
                 "ema20":  round(ema(closes[-20:], 20), 2),
@@ -282,8 +297,10 @@ class MarketAnalyzer:
                 "rsi14":  round(rsi, 1),
                 "change_1d":  round((closes[-1] - closes[-2]) / closes[-2] * 100, 2) if len(closes) >= 2 else 0,
                 "change_5d":  round((closes[-1] - closes[-6]) / closes[-6] * 100, 2) if len(closes) >= 6 else 0,
+                "change_10d": round((closes[-1] - closes[-11]) / closes[-11] * 100, 2) if len(closes) >= 11 else 0,
                 "change_20d": round((closes[-1] - closes[-21]) / closes[-21] * 100, 2) if len(closes) >= 21 else 0,
                 "volume_ratio": round(vol_avg5 / vol_avg20, 2) if vol_avg20 > 0 else 1.0,
+                "volume_trend": vol_trend,  # >1 = wolumen rośnie (panika), <1 = maleje (wyczerpanie)
                 "bars_count": len(closes),
             }
         except Exception as e:
@@ -301,22 +318,32 @@ class MarketAnalyzer:
         if not self.anthropic_key:
             return self.MODE_UNKNOWN, "Brak klucza Anthropic API"
 
-        prompt = f"""Jesteś ekspertem analizy technicznej giełdy USA. 
-Przeanalizuj poniższe dane SPY (S&P 500 ETF) i oceń czy obecny spadek to:
-- DIP (chwilowa korekta, warto trzymać pozycje i czekać na odbicie)
-- CRASH (silny trend spadkowy, należy zamknąć stratne pozycje)
+        prompt = f"""Jesteś ekspertem analizy technicznej giełdy USA.
+Przeanalizuj dane SPY (S&P 500 ETF) i oceń sytuację rynkową.
 
 Dane SPY:
-- Cena aktualna: ${spy.get('current_price')}
-- EMA20: {spy.get('ema20')} | EMA50: {spy.get('ema50')}
+- Cena: ${spy.get('current_price')} | EMA20: {spy.get('ema20')} | EMA50: {spy.get('ema50')}
 - RSI14: {spy.get('rsi14')}
-- Zmiana 1 dzień: {spy.get('change_1d')}%
-- Zmiana 5 dni: {spy.get('change_5d')}%
-- Zmiana 20 dni: {spy.get('change_20d')}%
-- Wolumen (ratio 5d/20d avg): {spy.get('volume_ratio')}x
+- Zmiana 1d: {spy.get('change_1d')}% | 5d: {spy.get('change_5d')}% | 10d: {spy.get('change_10d')}% | 20d: {spy.get('change_20d')}%
+- Wolumen ratio (5d/20d): {spy.get('volume_ratio')}x | Trend wolumenu (3d/3d-prev): {spy.get('volume_trend')}x
+
+Zasady oceny:
+NIE KUPUJ (CRASH) gdy:
+- Trend spadkowy > 2 tygodnie (change_10d < -5%)
+- Wolumen sprzedaży rośnie (volume_trend > 1.2 = panika)
+- RSI > 35 (rynek jeszcze nie wyprzedany)
+
+KUP OSTROŻNIE (DIP) gdy:
+- RSI < 32 (rynek mocno wyprzedany)
+- Wolumen sprzedaży maleje (volume_trend < 0.85 = wyczerpanie paniki)
+- Lub pojawił się sygnał odwrócenia (RSI < 35 + volume_trend < 1.0)
+
+Zwróć jeden z trybów:
+- DIP = chwilowa korekta, można kupować (mała pozycja)
+- CRASH = silny trend spadkowy, nie kupuj, zamknij straty
 
 Odpowiedz DOKŁADNIE w tym formacie JSON (nic poza JSON):
-{{"mode": "DIP" lub "CRASH", "confidence": 0-100, "reasoning": "krótkie uzasadnienie po polsku max 2 zdania"}}"""
+{{"mode": "DIP" lub "CRASH", "confidence": 0-100, "buy_signal": true/false, "reasoning": "max 2 zdania po polsku"}}"""
 
         try:
             resp = requests.post(
@@ -341,13 +368,15 @@ Odpowiedz DOKŁADNIE w tym formacie JSON (nic poza JSON):
             text = text.replace("```json", "").replace("```", "").strip()
             result = json.loads(text)
 
-            mode      = result.get("mode", self.MODE_UNKNOWN).upper()
+            mode       = result.get("mode", self.MODE_UNKNOWN).upper()
             confidence = result.get("confidence", 50)
-            reasoning = result.get("reasoning", "brak uzasadnienia")
+            reasoning  = result.get("reasoning", "brak uzasadnienia")
+            buy_signal = result.get("buy_signal", False)
 
             if mode not in (self.MODE_DIP, self.MODE_CRASH):
                 mode = self.MODE_UNKNOWN
 
+            self._buy_signal = bool(buy_signal)
             return mode, f"[{confidence}% pewności] {reasoning}"
 
         except Exception as e:
@@ -410,6 +439,10 @@ Odpowiedz DOKŁADNIE w tym formacie JSON (nic poza JSON):
     def reset_trailing_sl(self, sym: str):
         """Usuń trailing SL po sprzedaży pozycji."""
         self._trailing_sl.pop(sym, None)
+
+    def get_buy_signal(self) -> bool:
+        """Czy Claude AI dał sygnał kupna? (RSI oversold + wyczerpanie paniki)"""
+        return self._buy_signal
 
     def get_status(self) -> str:
         return f"{self._mode}: {self._reasoning}"
@@ -1241,33 +1274,65 @@ class AggressiveBot:
             entry_signal = is_at_dip and is_rebounding and sentiment_ok
             cooled = (time.time() - self.last_trade[sym]) >= self.cfg.cooldown_sec
             can_trade = self.can_trade_today(sym)
-            
+
+            # v7.0: Pobierz ocenę rynku od Claude AI
+            market_mode = MarketAnalyzer.MODE_UNKNOWN
+            claude_buy_signal = False
+            if self.market_analyzer:
+                market_mode = self.market_analyzer.analyze()
+                claude_buy_signal = self.market_analyzer.get_buy_signal()
+
+            # v7.0: CRASH BUYING — mała pozycja gdy rynek wyprzedany
+            # Claude mówi buy_signal=True gdy: RSI<32 + wolumen maleje
+            crash_entry = (
+                claude_buy_signal
+                and not allow_buy           # regime mówi BEAR — normalnie by zablokował
+                and is_rebounding           # ale jest lokalne odbicie
+                and sentiment_ok
+            )
+
             logger.info(f"{sym} | ${price:.2f} | YdayLow=${yday_low:.2f} Thresh=${dip_threshold:.2f} | "
                          f"Dip={'YES' if is_at_dip else 'NO'} Rebound={rebound_pct:+.2f}% | "
-                         f"Sentiment={sentiment_score:+.2f} | ATR=${atr_val:.2f}")
-            
-            if not allow_buy and entry_signal:
+                         f"Sentiment={sentiment_score:+.2f} | ATR=${atr_val:.2f} | "
+                         f"Market={market_mode} BuySignal={claude_buy_signal}")
+
+            if not allow_buy and entry_signal and not crash_entry:
                 logger.info(f"{sym} | 🛑 BEAR MARKET - pomijam BUY mimo sygnału")
-            
+
+            # Normalny BUY (bull/sideways) — cały kapitał (95%)
             if entry_signal and cooled and can_trade and allow_buy:
                 qty = (cash * self.cfg.max_pos_pct) / price
-                
+                buy_mode = "NORMAL"
+                buy_pct = self.cfg.max_pos_pct
+
+            # Crash BUY — mała pozycja (30%), tylko gdy Claude dał sygnał
+            elif crash_entry and cooled and can_trade:
+                qty = (cash * self.cfg.crash_buy_pct) / price
+                buy_mode = "CRASH_BUY"
+                buy_pct = self.cfg.crash_buy_pct
+                logger.info(f"{sym} | 🎯 CRASH BUY SIGNAL — RSI oversold + wolumen maleje")
+            else:
+                qty = 0
+                buy_mode = None
+                buy_pct = 0
+
+            if qty is not None and qty > 0:
                 if not self.cfg.fractional_enabled:
                     qty = int(qty)
-                
+
                 if qty > 0:
                     self.last_trade[sym] = time.time()
                     action = "BUY"
-                    reason = f"dip_entry_yday_low+{self.cfg.dip_tolerance_pct}%"
-                    
+                    reason = f"crash_buy_{self.cfg.crash_buy_pct*100:.0f}pct" if buy_mode == "CRASH_BUY" else f"dip_entry_yday_low+{self.cfg.dip_tolerance_pct}%"
+
                     logger.info(
-                        f"{sym} | 🎯 BUY {qty:.4f} @${price:.2f} | ALL-IN ({self.cfg.max_pos_pct*100}%) | "
+                        f"{sym} | 🎯 BUY {qty:.4f} @${price:.2f} | {buy_mode} ({buy_pct*100:.0f}%) | "
                         f"YdayLow=${yday_low:.2f} Rebound={rebound_pct:+.2f}% | "
                         f"TP=${price + atr_val * self.cfg.atr_tp_multiplier:.2f} "
                         f"SL=${price - atr_val * self.cfg.atr_sl_multiplier:.2f}")
-                    
+
                     order = self.submit_order(sym, OrderSide.BUY, qty)
-                    
+
                     if order:
                         self.entry_price[sym] = price
                         entry = price
@@ -1275,7 +1340,6 @@ class AggressiveBot:
                             tp_price = entry + (atr_val * self.cfg.atr_tp_multiplier)
                             sl_price = entry - (atr_val * self.cfg.atr_sl_multiplier)
                         cash -= qty * price
-                        # v6.0: Wyślij do Google Sheets
                         self.sheets.send_trade(
                             symbol=sym, action="BUY", price=price,
                             entry_price=price, pl_pct=None, reason=reason,
