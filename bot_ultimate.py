@@ -1415,11 +1415,8 @@ class AggressiveBot:
 
             # v7.0: Konsultacja z GPW botem
             partner_ok = True
-            partner_reason = ""
             if self.bot_sync:
                 partner_ok, partner_reason = self.bot_sync.partner_confirms_buy()
-                if partner_reason:
-                    logger.info(f"{sym} | 🤝 Partner ({self.bot_sync.other}): {partner_reason}")
 
             # v7.0: CRASH BUYING — mała pozycja gdy Claude daje buy_signal
             # Działa niezależnie od regime (nawet w BULL może kupować ostrożnie)
@@ -1463,7 +1460,7 @@ class AggressiveBot:
                 qty = (cash * self.cfg.crash_buy_pct) / price
                 buy_mode = "OPPORTUNISTIC"
                 buy_pct = self.cfg.crash_buy_pct
-                logger.info(f"{sym} | 🔔 OPPORTUNISTIC BUY — Claude: RSI oversold, brak klasycznego dip")
+                logger.info(f"{sym} | 🔔 OPPORTUNISTIC BUY — Claude: RSI oversold | 🤝 {self.bot_sync.other if self.bot_sync else 'solo'}: {partner_reason}")
 
             # Crash BUY (BEAR regime + Claude buy_signal) — 30%
             elif crash_entry and cooled and can_trade:
