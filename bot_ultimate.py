@@ -1029,14 +1029,28 @@ class BotSync:
         self._cache  = None
         self._cache_ts = 0
         self._CACHE_TTL = 1800  # 30 min
+        self._last_published_mode = ""   # ostatni opublikowany tryb
+        self._last_publish_ts = 0        # timestamp ostatniej publikacji
         if self.enabled:
             logger.info(f"BotSync: aktywny | bot={bot_id} partner={self.other}")
 
     def publish(self, market_mode: str, buy_signal: bool,
                 reasoning: str, spy_data: dict):
-        """Opublikuj swój sygnał po analizie Claude AI"""
+        """Opublikuj sygnał — tylko gdy tryb się zmienia lub co 30 min"""
         if not self.enabled:
             return
+
+        now = time.time()
+        mode_changed = (market_mode != self._last_published_mode)
+        time_elapsed = (now - self._last_publish_ts) > 1800  # co 30 min nawet bez zmiany
+
+        if not mode_changed and not time_elapsed:
+            return  # nic się nie zmieniło — nie zapisuj do Sheets
+
+        # Ustaw od razu — nawet jeśli request się nie uda, nie spamuj Sheets
+        self._last_published_mode = market_mode
+        self._last_publish_ts = now
+
         try:
             requests.post(self.url, json={
                 "type":        "bot_signal",
@@ -1051,7 +1065,7 @@ class BotSync:
                 "ema20":       spy_data.get("ema20", 0),
                 "ema50":       spy_data.get("ema50", 0),
             }, timeout=10)
-            logger.info(f"BotSync ✅ {self.bot_id} → {market_mode} buy={buy_signal}")
+            logger.info(f"BotSync ✅ {self.bot_id} → {market_mode} buy={buy_signal} {'(zmiana trybu!)' if mode_changed else '(30min refresh)'}")
         except Exception as e:
             logger.warning(f"BotSync publish błąd: {e}")
 
