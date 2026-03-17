@@ -1508,7 +1508,7 @@ class AggressiveBot:
                     self.cfg.opp_daily_limit - self._opp_daily_spent,
                     cash * 0.95
                 )
-                qty = opp_amount / price if opp_amount > 10 else 0
+                qty = opp_amount / price if opp_amount >= 50 else 0
                 buy_mode = "OPPORTUNISTIC"
                 buy_pct  = opp_amount / cash if cash > 0 else 0
                 remaining = self.cfg.opp_daily_limit - self._opp_daily_spent - opp_amount
