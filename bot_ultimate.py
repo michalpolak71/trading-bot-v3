@@ -110,6 +110,8 @@ class Config:
     market_analysis_interval: int    # sekundy między analizami (domyślnie 1800 = 30 min)
     trailing_stop_pct: float         # % trailing stop gdy DIP (domyślnie 3.0)
     crash_buy_pct: float             # % kapitału przy crash-buying (domyślnie 0.30)
+    opp_tp_pct: float                # % TP dla OPPORTUNISTIC/CRASH BUY (domyślnie 1.5)
+    opp_sl_pct: float                # % SL dla OPPORTUNISTIC/CRASH BUY (domyślnie 1.0)
     
     # Data
     db_path: str
@@ -156,6 +158,8 @@ def load_config() -> Config:
         market_analysis_interval=int(os.getenv("MARKET_ANALYSIS_INTERVAL", "1800")),
         trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "3.0")),
         crash_buy_pct=float(os.getenv("CRASH_BUY_PCT", "0.30")),
+        opp_tp_pct=float(os.getenv("OPP_TP_PCT", "1.5")),
+        opp_sl_pct=float(os.getenv("OPP_SL_PCT", "1.0")),
         
         db_path=os.getenv("DB_PATH", "bot_ultimate.db"),
         data_feed=os.getenv("DATA_FEED", "iex").lower(),
@@ -1345,18 +1349,28 @@ class AggressiveBot:
                     action = "BUY"
                     reason = f"crash_buy_{self.cfg.crash_buy_pct*100:.0f}pct" if buy_mode == "CRASH_BUY" else f"dip_entry_yday_low+{self.cfg.dip_tolerance_pct}%"
 
+                    if buy_mode in ("OPPORTUNISTIC", "CRASH_BUY"):
+                        tp_log = price * (1 + self.cfg.opp_tp_pct / 100)
+                        sl_log = price * (1 - self.cfg.opp_sl_pct / 100)
+                    else:
+                        tp_log = price + atr_val * self.cfg.atr_tp_multiplier
+                        sl_log = price - atr_val * self.cfg.atr_sl_multiplier
                     logger.info(
                         f"{sym} | 🎯 BUY {qty:.4f} @${price:.2f} | {buy_mode} ({buy_pct*100:.0f}%) | "
                         f"YdayLow=${yday_low:.2f} Rebound={rebound_pct:+.2f}% | "
-                        f"TP=${price + atr_val * self.cfg.atr_tp_multiplier:.2f} "
-                        f"SL=${price - atr_val * self.cfg.atr_sl_multiplier:.2f}")
+                        f"TP=${tp_log:.2f} (+{self.cfg.opp_tp_pct if buy_mode in ('OPPORTUNISTIC','CRASH_BUY') else atr_val*self.cfg.atr_tp_multiplier:.1f}{'%' if buy_mode in ('OPPORTUNISTIC','CRASH_BUY') else '$'}) "
+                        f"SL=${sl_log:.2f} (-{self.cfg.opp_sl_pct if buy_mode in ('OPPORTUNISTIC','CRASH_BUY') else atr_val*self.cfg.atr_sl_multiplier:.1f}{'%' if buy_mode in ('OPPORTUNISTIC','CRASH_BUY') else '$'})")
 
                     order = self.submit_order(sym, OrderSide.BUY, qty)
 
                     if order:
                         self.entry_price[sym] = price
                         entry = price
-                        if atr_val > 0:
+                        if buy_mode in ("OPPORTUNISTIC", "CRASH_BUY"):
+                            # Stały % TP/SL dla agresywnych wejść
+                            tp_price = entry * (1 + self.cfg.opp_tp_pct / 100)
+                            sl_price = entry * (1 - self.cfg.opp_sl_pct / 100)
+                        elif atr_val > 0:
                             tp_price = entry + (atr_val * self.cfg.atr_tp_multiplier)
                             sl_price = entry - (atr_val * self.cfg.atr_sl_multiplier)
                         cash -= qty * price
