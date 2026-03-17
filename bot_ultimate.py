@@ -1282,12 +1282,25 @@ class AggressiveBot:
                 market_mode = self.market_analyzer.analyze()
                 claude_buy_signal = self.market_analyzer.get_buy_signal()
 
-            # v7.0: CRASH BUYING — mała pozycja gdy rynek wyprzedany
-            # Claude mówi buy_signal=True gdy: RSI<32 + wolumen maleje
+            # v7.0: CRASH BUYING — mała pozycja gdy Claude daje buy_signal
+            # Działa niezależnie od regime (nawet w BULL może kupować ostrożnie)
+            # Warunek: Claude mówi buy_signal=True (RSI<32 + wolumen maleje)
+            #          + lokalne odbicie (is_rebounding)
+            #          + nie ma już otwartej pozycji (pos_qty == 0, jesteśmy w tym bloku)
             crash_entry = (
                 claude_buy_signal
-                and not allow_buy           # regime mówi BEAR — normalnie by zablokował
-                and is_rebounding           # ale jest lokalne odbicie
+                and is_rebounding
+                and sentiment_ok
+                and not allow_buy  # tylko gdy regime blokuje normalny BUY
+            )
+
+            # Alternatywnie: w BULL + DIP signal od Claude → normalny entry wystarczy
+            # W BULL + brak DIP ale jest buy_signal → crash_buy jako "oportunistyczny"
+            opportunistic_entry = (
+                claude_buy_signal
+                and allow_buy           # regime OK
+                and not is_at_dip       # nie ma klasycznego dip sygnału
+                and is_rebounding
                 and sentiment_ok
             )
 
@@ -1299,18 +1312,25 @@ class AggressiveBot:
             if not allow_buy and entry_signal and not crash_entry:
                 logger.info(f"{sym} | 🛑 BEAR MARKET - pomijam BUY mimo sygnału")
 
-            # Normalny BUY (bull/sideways) — cały kapitał (95%)
+            # Normalny BUY (bull/sideways + klasyczny dip) — cały kapitał (95%)
             if entry_signal and cooled and can_trade and allow_buy:
                 qty = (cash * self.cfg.max_pos_pct) / price
                 buy_mode = "NORMAL"
                 buy_pct = self.cfg.max_pos_pct
 
-            # Crash BUY — mała pozycja (30%), tylko gdy Claude dał sygnał
+            # Oportunistyczny BUY (BULL + Claude buy_signal, bez klasycznego dip) — 30%
+            elif opportunistic_entry and cooled and can_trade:
+                qty = (cash * self.cfg.crash_buy_pct) / price
+                buy_mode = "OPPORTUNISTIC"
+                buy_pct = self.cfg.crash_buy_pct
+                logger.info(f"{sym} | 🔔 OPPORTUNISTIC BUY — Claude: RSI oversold, brak klasycznego dip")
+
+            # Crash BUY (BEAR regime + Claude buy_signal) — 30%
             elif crash_entry and cooled and can_trade:
                 qty = (cash * self.cfg.crash_buy_pct) / price
                 buy_mode = "CRASH_BUY"
                 buy_pct = self.cfg.crash_buy_pct
-                logger.info(f"{sym} | 🎯 CRASH BUY SIGNAL — RSI oversold + wolumen maleje")
+                logger.info(f"{sym} | 🎯 CRASH BUY — regime BEAR ale Claude: RSI oversold + wolumen maleje")
             else:
                 qty = 0
                 buy_mode = None
