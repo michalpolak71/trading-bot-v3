@@ -927,6 +927,15 @@ class TradingDB:
         row = cur.fetchone()
         return int(row[0]) > 0 if row else False
 
+    def sold_today(self, symbol: str) -> bool:
+        """Czy sprzedałem ten symbol DZIŚ? Jeśli tak, BUY = day-trade violation."""
+        today = utc_now().strftime("%Y-%m-%d")
+        cur = self.conn.execute(
+            "SELECT COUNT(*) FROM signals WHERE symbol=? AND action='SELL' AND DATE(ts_utc)=?",
+            (symbol, today))
+        row = cur.fetchone()
+        return int(row[0]) > 0 if row else False
+
 
 # ============================================================================
 # v7.0: GOOGLE SHEETS WEBHOOK (przez Apps Script - bez service account)
@@ -1428,6 +1437,11 @@ class AggressiveBot:
             cooled = (time.time() - self.last_trade[sym]) >= self.cfg.cooldown_sec
             can_trade = self.can_trade_today(sym)
 
+            # PDT: nie kupuj symbolu który już dziś sprzedałeś (day-trade violation)
+            sold_today = self.db.sold_today(sym)
+            if sold_today:
+                logger.info(f"{sym} | ⛔ PDT: sprzedany dziś — pomijam BUY do jutra")
+
             # v7.0: Pobierz ocenę rynku od Claude AI
             market_mode = MarketAnalyzer.MODE_UNKNOWN
             claude_buy_signal = False
@@ -1480,14 +1494,14 @@ class AggressiveBot:
                 logger.info(f"{sym} | 🛑 BEAR MARKET - pomijam BUY mimo sygnału")
 
             # Normalny BUY (bull/sideways + klasyczny dip) — cały kapitał (95%)
-            if entry_signal and cooled and can_trade and allow_buy:
+            if entry_signal and cooled and can_trade and allow_buy and not sold_today:
                 qty = (cash * self.cfg.max_pos_pct) / price
                 buy_mode = "NORMAL"
                 buy_pct = self.cfg.max_pos_pct
 
             # Oportunistyczny BUY (BULL + Claude buy_signal) — max $300, limit $500/dzień
-            # Blokowany gdy partner widzi CRASH
-            elif opportunistic_entry and cooled and can_trade and partner_ok:
+            # Blokowany gdy partner widzi CRASH lub symbol sprzedany dziś
+            elif opportunistic_entry and cooled and can_trade and partner_ok and not sold_today:
                 # Kwota: min(opp_max_position, pozostały dzienny budżet, dostępny cash)
                 opp_amount = min(
                     self.cfg.opp_max_position,
@@ -1504,7 +1518,7 @@ class AggressiveBot:
                     f"| 🤝 {self.bot_sync.other if self.bot_sync else 'solo'}: {partner_reason}")
 
             # Crash BUY (BEAR regime + Claude buy_signal) — 30%
-            elif crash_entry and cooled and can_trade:
+            elif crash_entry and cooled and can_trade and not sold_today:
                 qty = (cash * self.cfg.crash_buy_pct) / price
                 buy_mode = "CRASH_BUY"
                 buy_pct = self.cfg.crash_buy_pct
