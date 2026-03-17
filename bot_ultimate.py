@@ -247,6 +247,7 @@ class MarketAnalyzer:
         self._reasoning    = "Brak analizy"
         self._buy_signal   = False   # Claude mówi: teraz dobry moment na zakup?
         self._last_check   = 0
+        self._last_spy_data = {}     # cache danych SPY dla BotSync
         self._trailing_sl: Dict[str, float] = {}   # sym → aktualny trailing SL
 
     # ------------------------------------------------------------------
@@ -408,6 +409,7 @@ Odpowiedz DOKŁADNIE w tym formacie JSON (nic poza JSON):
             self._last_check = now
             return self._mode
 
+        self._last_spy_data = spy  # cache dla BotSync
         mode, reasoning = self._ask_claude(spy)
         self._mode      = mode
         self._reasoning = reasoning
@@ -1281,6 +1283,16 @@ class AggressiveBot:
         
         # v7.0: ML co 6h
         self.ml.maybe_analyze()
+
+        # v7.0: Publikuj sygnał NYSE raz na cykl (nie per symbol)
+        if self.market_analyzer and self.bot_sync:
+            _mode = self.market_analyzer.analyze()
+            _spy  = self.market_analyzer._last_spy_data if hasattr(self.market_analyzer, '_last_spy_data') else {}
+            self.bot_sync.publish(
+                _mode,
+                self.market_analyzer.get_buy_signal(),
+                self.market_analyzer._reasoning,
+                _spy)
         
         try:
             acct = self.trading.get_account()
@@ -1400,13 +1412,6 @@ class AggressiveBot:
             if self.market_analyzer:
                 market_mode = self.market_analyzer.analyze()
                 claude_buy_signal = self.market_analyzer.get_buy_signal()
-
-                # v7.0: Publikuj sygnał do Google Sheets (żeby GPW bot mógł czytać)
-                if self.bot_sync:
-                    spy = self.market_analyzer._get_spy_data()
-                    self.bot_sync.publish(
-                        market_mode, claude_buy_signal,
-                        self.market_analyzer._reasoning, spy)
 
             # v7.0: Konsultacja z GPW botem
             partner_ok = True
