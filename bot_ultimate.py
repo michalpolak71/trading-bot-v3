@@ -114,6 +114,9 @@ class Config:
     bot_id: str                      # NYSE lub GPW
     opp_tp_pct: float                # % TP dla OPPORTUNISTIC/CRASH BUY (domyślnie 1.5)
     opp_sl_pct: float                # % SL dla OPPORTUNISTIC/CRASH BUY (domyślnie 1.0)
+    opp_max_position: float          # max $ na jedną pozycję OPPORTUNISTIC (domyślnie 300)
+    opp_daily_limit: float           # max $ łącznego ryzyka OPPORTUNISTIC dziennie (domyślnie 500)
+    opp_min_rebound: float           # min Rebound% żeby wejść (domyślnie -0.5)
     
     # Data
     db_path: str
@@ -162,6 +165,9 @@ def load_config() -> Config:
         crash_buy_pct=float(os.getenv("CRASH_BUY_PCT", "0.30")),
         opp_tp_pct=float(os.getenv("OPP_TP_PCT", "1.5")),
         opp_sl_pct=float(os.getenv("OPP_SL_PCT", "1.0")),
+        opp_max_position=float(os.getenv("OPP_MAX_POSITION", "300")),
+        opp_daily_limit=float(os.getenv("OPP_DAILY_LIMIT", "500")),
+        opp_min_rebound=float(os.getenv("OPP_MIN_REBOUND", "-0.5")),
         bot_sync_enabled=os.getenv("BOT_SYNC_ENABLED", "false").lower() == "true",
         bot_id=os.getenv("BOT_ID", "NYSE"),
         
@@ -1150,6 +1156,8 @@ class AggressiveBot:
         self.last_trade: Dict[str, float] = {s: 0.0 for s in cfg.symbols}
         self.entry_price: Dict[str, float] = {}
         self.start_equity: Optional[float] = None
+        self._opp_daily_spent: float = 0.0   # ile $ wydano na OPPORTUNISTIC dziś
+        self._opp_daily_date: str = ""        # data resetu licznika
         
         self._load_entry_prices()
         
@@ -1430,14 +1438,23 @@ class AggressiveBot:
                 and not allow_buy  # tylko gdy regime blokuje normalny BUY
             )
 
-            # Alternatywnie: w BULL + DIP signal od Claude → normalny entry wystarczy
-            # W BULL + brak DIP ale jest buy_signal → crash_buy jako "oportunistyczny"
+            # v7.0: OPPORTUNISTIC ENTRY z limitem ryzyka
+            # Resetuj licznik dzienny jeśli nowy dzień
+            today_str = utc_now().strftime("%Y-%m-%d")
+            if self._opp_daily_date != today_str:
+                self._opp_daily_spent = 0.0
+                self._opp_daily_date  = today_str
+
+            opp_budget_ok   = self._opp_daily_spent < self.cfg.opp_daily_limit
+            opp_rebound_ok  = rebound_pct >= self.cfg.opp_min_rebound  # > -0.5%
+
             opportunistic_entry = (
                 claude_buy_signal
                 and allow_buy           # regime OK
                 and not is_at_dip       # nie ma klasycznego dip sygnału
-                and is_rebounding
+                and opp_rebound_ok      # nie pikuje mocno w dół
                 and sentiment_ok
+                and opp_budget_ok       # nie przekroczono dziennego limitu
             )
 
             logger.info(f"{sym} | ${price:.2f} | YdayLow=${yday_low:.2f} Thresh=${dip_threshold:.2f} | "
@@ -1454,13 +1471,23 @@ class AggressiveBot:
                 buy_mode = "NORMAL"
                 buy_pct = self.cfg.max_pos_pct
 
-            # Oportunistyczny BUY (BULL + Claude buy_signal, bez klasycznego dip) — 30%
+            # Oportunistyczny BUY (BULL + Claude buy_signal) — max $300, limit $500/dzień
             # Blokowany gdy partner widzi CRASH
             elif opportunistic_entry and cooled and can_trade and partner_ok:
-                qty = (cash * self.cfg.crash_buy_pct) / price
+                # Kwota: min(opp_max_position, pozostały dzienny budżet, dostępny cash)
+                opp_amount = min(
+                    self.cfg.opp_max_position,
+                    self.cfg.opp_daily_limit - self._opp_daily_spent,
+                    cash * 0.95
+                )
+                qty = opp_amount / price if opp_amount > 10 else 0
                 buy_mode = "OPPORTUNISTIC"
-                buy_pct = self.cfg.crash_buy_pct
-                logger.info(f"{sym} | 🔔 OPPORTUNISTIC BUY — Claude: RSI oversold | 🤝 {self.bot_sync.other if self.bot_sync else 'solo'}: {partner_reason}")
+                buy_pct  = opp_amount / cash if cash > 0 else 0
+                remaining = self.cfg.opp_daily_limit - self._opp_daily_spent - opp_amount
+                logger.info(
+                    f"{sym} | 🔔 OPPORTUNISTIC BUY ${opp_amount:.0f} "
+                    f"(dzienny limit: ${self._opp_daily_spent:.0f}+${opp_amount:.0f}/${self.cfg.opp_daily_limit:.0f}) "
+                    f"| 🤝 {self.bot_sync.other if self.bot_sync else 'solo'}: {partner_reason}")
 
             # Crash BUY (BEAR regime + Claude buy_signal) — 30%
             elif crash_entry and cooled and can_trade:
@@ -1507,6 +1534,10 @@ class AggressiveBot:
                             tp_price = entry + (atr_val * self.cfg.atr_tp_multiplier)
                             sl_price = entry - (atr_val * self.cfg.atr_sl_multiplier)
                         cash -= qty * price
+                        # Zaktualizuj dzienny licznik OPPORTUNISTIC
+                        if buy_mode == "OPPORTUNISTIC":
+                            self._opp_daily_spent += qty * price
+                            logger.info(f"{sym} | 💰 OPP dzienny wydatek: ${self._opp_daily_spent:.0f}/${self.cfg.opp_daily_limit:.0f}")
                         self.sheets.send_trade(
                             symbol=sym, action="BUY", price=price,
                             entry_price=price, pl_pct=None, reason=reason,
