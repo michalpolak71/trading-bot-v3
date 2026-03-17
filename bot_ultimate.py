@@ -110,6 +110,8 @@ class Config:
     market_analysis_interval: int    # sekundy między analizami (domyślnie 1800 = 30 min)
     trailing_stop_pct: float         # % trailing stop gdy DIP (domyślnie 3.0)
     crash_buy_pct: float             # % kapitału przy crash-buying (domyślnie 0.30)
+    bot_sync_enabled: bool           # czy synchronizować z GPW botem
+    bot_id: str                      # NYSE lub GPW
     opp_tp_pct: float                # % TP dla OPPORTUNISTIC/CRASH BUY (domyślnie 1.5)
     opp_sl_pct: float                # % SL dla OPPORTUNISTIC/CRASH BUY (domyślnie 1.0)
     
@@ -160,6 +162,8 @@ def load_config() -> Config:
         crash_buy_pct=float(os.getenv("CRASH_BUY_PCT", "0.30")),
         opp_tp_pct=float(os.getenv("OPP_TP_PCT", "1.5")),
         opp_sl_pct=float(os.getenv("OPP_SL_PCT", "1.0")),
+        bot_sync_enabled=os.getenv("BOT_SYNC_ENABLED", "false").lower() == "true",
+        bot_id=os.getenv("BOT_ID", "NYSE"),
         
         db_path=os.getenv("DB_PATH", "bot_ultimate.db"),
         data_feed=os.getenv("DATA_FEED", "iex").lower(),
@@ -994,6 +998,111 @@ class SheetsWebhook:
         })
 
 
+
+
+# ============================================================================
+# v7.0: BOT SYNC — konsultacja z GPW botem przez Google Sheets
+# ============================================================================
+class BotSync:
+    """
+    Synchronizuje sygnały między NYSE botem (Railway) a GPW botem (OVH).
+    Oba boty piszą swoje sygnały do Google Sheets i czytają sygnały partnera.
+    
+    Ustaw: BOT_SYNC_ENABLED=true, BOT_ID=NYSE (lub GPW)
+    """
+    BOT_GPW  = "GPW"
+    BOT_NYSE = "NYSE"
+
+    def __init__(self, webhook_url: str, bot_id: str = "NYSE"):
+        self.url     = webhook_url
+        self.bot_id  = bot_id
+        self.other   = self.BOT_GPW if bot_id == self.BOT_NYSE else self.BOT_NYSE
+        self.enabled = bool(webhook_url)
+        self._cache  = None
+        self._cache_ts = 0
+        self._CACHE_TTL = 1800  # 30 min
+        if self.enabled:
+            logger.info(f"BotSync: aktywny | bot={bot_id} partner={self.other}")
+
+    def publish(self, market_mode: str, buy_signal: bool,
+                reasoning: str, spy_data: dict):
+        """Opublikuj swój sygnał po analizie Claude AI"""
+        if not self.enabled:
+            return
+        try:
+            requests.post(self.url, json={
+                "type":        "bot_signal",
+                "bot_id":      self.bot_id,
+                "timestamp":   utc_now().isoformat(),
+                "market_mode": market_mode,
+                "buy_signal":  buy_signal,
+                "reasoning":   reasoning,
+                "spy_rsi":     spy_data.get("rsi14", 0),
+                "spy_5d":      spy_data.get("change_5d", 0),
+                "spy_price":   spy_data.get("current_price", 0),
+                "ema20":       spy_data.get("ema20", 0),
+                "ema50":       spy_data.get("ema50", 0),
+            }, timeout=10)
+            logger.info(f"BotSync ✅ {self.bot_id} → {market_mode} buy={buy_signal}")
+        except Exception as e:
+            logger.warning(f"BotSync publish błąd: {e}")
+
+    def get_partner(self) -> dict:
+        """Pobierz ostatni sygnał partnera (z cache 30 min)"""
+        if not self.enabled:
+            return {}
+        now = time.time()
+        if self._cache and (now - self._cache_ts) < self._CACHE_TTL:
+            return self._cache
+        try:
+            r = requests.get(
+                self.url,
+                params={"type": "get_signal", "bot_id": self.other},
+                timeout=10
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("status") == "ok" and data.get("signal"):
+                    self._cache = data["signal"]
+                    self._cache_ts = now
+                    logger.info(f"BotSync 📥 {self.other}: "
+                               f"{self._cache.get('market_mode')} "
+                               f"buy={self._cache.get('buy_signal')}")
+                    return self._cache
+        except Exception as e:
+            logger.warning(f"BotSync get_partner błąd: {e}")
+        return {}
+
+    def partner_confirms_buy(self) -> tuple:
+        """
+        Zwraca (potwierdza: bool, powód: str)
+        True = partner też widzi DIP → większa pewność
+        False = partner widzi CRASH → ostrożniej
+        """
+        s = self.get_partner()
+        if not s:
+            return True, "brak sygnału partnera — domyślnie OK"
+
+        mode = s.get("market_mode", "UNKNOWN")
+        buy  = s.get("buy_signal", False)
+        reason = s.get("reasoning", "")[:80]
+
+        if mode == "CRASH":
+            return False, f"{self.other} widzi CRASH — ostrożniej! {reason}"
+        if mode == "DIP" and buy:
+            return True, f"{self.other} potwierdza DIP+BUY: {reason}"
+        return True, f"{self.other}: {mode} (neutralne)"
+
+    def get_claude_context(self) -> str:
+        """Kontekst dla Claude AI — co widzi partner"""
+        s = self.get_partner()
+        if not s:
+            return ""
+        return (f"\nKontekst od bota {self.other} (ten sam rynek, inna sesja): "
+                f"ocena={s.get('market_mode')} buy={s.get('buy_signal')} "
+                f"RSI={s.get('spy_rsi')} SPY5d={s.get('spy_5d')}% "
+                f"→ {s.get('reasoning','')[:100]}")
+
 # ============================================================================
 # BOT v7.0 - ADAPTIVE DIP BUYER + CLAUDE AI
 # ============================================================================
@@ -1029,6 +1138,12 @@ class AggressiveBot:
         
         # v7.0: Google Sheets Webhook
         self.sheets = SheetsWebhook(os.getenv("SHEETS_WEBHOOK_URL", ""))
+
+        # v7.0: Bot Sync (konsultacja z GPW botem przez Google Sheets)
+        self.bot_sync = BotSync(
+            webhook_url=os.getenv("SHEETS_WEBHOOK_URL", ""),
+            bot_id=cfg.bot_id
+        ) if cfg.bot_sync_enabled else None
         
         self.last_trade: Dict[str, float] = {s: 0.0 for s in cfg.symbols}
         self.entry_price: Dict[str, float] = {}
@@ -1286,6 +1401,21 @@ class AggressiveBot:
                 market_mode = self.market_analyzer.analyze()
                 claude_buy_signal = self.market_analyzer.get_buy_signal()
 
+                # v7.0: Publikuj sygnał do Google Sheets (żeby GPW bot mógł czytać)
+                if self.bot_sync:
+                    spy = self.market_analyzer._get_spy_data()
+                    self.bot_sync.publish(
+                        market_mode, claude_buy_signal,
+                        self.market_analyzer._reasoning, spy)
+
+            # v7.0: Konsultacja z GPW botem
+            partner_ok = True
+            partner_reason = ""
+            if self.bot_sync:
+                partner_ok, partner_reason = self.bot_sync.partner_confirms_buy()
+                if partner_reason:
+                    logger.info(f"{sym} | 🤝 Partner ({self.bot_sync.other}): {partner_reason}")
+
             # v7.0: CRASH BUYING — mała pozycja gdy Claude daje buy_signal
             # Działa niezależnie od regime (nawet w BULL może kupować ostrożnie)
             # Warunek: Claude mówi buy_signal=True (RSI<32 + wolumen maleje)
@@ -1323,7 +1453,8 @@ class AggressiveBot:
                 buy_pct = self.cfg.max_pos_pct
 
             # Oportunistyczny BUY (BULL + Claude buy_signal, bez klasycznego dip) — 30%
-            elif opportunistic_entry and cooled and can_trade:
+            # Blokowany gdy partner widzi CRASH
+            elif opportunistic_entry and cooled and can_trade and partner_ok:
                 qty = (cash * self.cfg.crash_buy_pct) / price
                 buy_mode = "OPPORTUNISTIC"
                 buy_pct = self.cfg.crash_buy_pct
