@@ -1511,11 +1511,13 @@ class AggressiveBot:
                 qty = opp_amount / price if opp_amount >= 50 else 0
                 buy_mode = "OPPORTUNISTIC"
                 buy_pct  = opp_amount / cash if cash > 0 else 0
-                remaining = self.cfg.opp_daily_limit - self._opp_daily_spent - opp_amount
-                logger.info(
-                    f"{sym} | 🔔 OPPORTUNISTIC BUY ${opp_amount:.0f} "
-                    f"(dzienny limit: ${self._opp_daily_spent:.0f}+${opp_amount:.0f}/${self.cfg.opp_daily_limit:.0f}) "
-                    f"| 🤝 {self.bot_sync.other if self.bot_sync else 'solo'}: {partner_reason}")
+                if qty == 0:
+                    logger.info(f"{sym} | ⏭️ OPPORTUNISTIC pominięty — za mało cash (${opp_amount:.0f} < $50)")
+                else:
+                    logger.info(
+                        f"{sym} | 🔔 OPPORTUNISTIC BUY ${opp_amount:.0f} "
+                        f"(dzienny limit: ${self._opp_daily_spent:.0f}+${opp_amount:.0f}/${self.cfg.opp_daily_limit:.0f}) "
+                        f"| 🤝 {self.bot_sync.other if self.bot_sync else 'solo'}: {partner_reason}")
 
             # Crash BUY (BEAR regime + Claude buy_signal) — 30%
             elif crash_entry and cooled and can_trade and not sold_today:
@@ -1616,7 +1618,29 @@ class AggressiveBot:
                         f"P/L: {pnl_now:+.2f}%")
 
             # PDT PROTECTION: Nie sprzedawaj tego samego dnia co kupiłeś
+            # Sprawdzamy DB + datę pozycji z Alpaca (na wypadek restartu bota)
             pdt_block = self.db.bought_today(sym)
+
+            # Dodatkowe sprawdzenie przez Alpaca - jeśli DB jest pusta po restarcie
+            if not pdt_block and pos:
+                try:
+                    pos_data = pos.model_dump() if hasattr(pos, 'model_dump') else {}
+                    # Alpaca zwraca asset_marginable i inne pola ale nie datę zakupu wprost
+                    # Sprawdzamy avg_entry_price - jeśli pozycja z dziś, DB powinna mieć wpis
+                    # Fallback: jeśli brak wpisu w DB a pozycja istnieje, sprawdź orders API
+                    orders = self.trading.get_orders(filter=dict(symbols=[sym], status='filled', limit=1))
+                    if orders:
+                        import datetime as _dt
+                        order_date = orders[0].filled_at
+                        if order_date:
+                            today_utc = utc_now().strftime("%Y-%m-%d")
+                            order_day = order_date.strftime("%Y-%m-%d") if hasattr(order_date, 'strftime') else str(order_date)[:10]
+                            if order_day == today_utc:
+                                pdt_block = True
+                                logger.info(f"{sym} | ⏳ PDT HOLD (Alpaca orders) - kupione dziś o {order_date}")
+                except Exception:
+                    pass
+
             if pdt_block and (tp_hit or sl_hit):
                 logger.info(
                     f"{sym} | ⏳ PDT HOLD - kupione dziś, czekam do jutra | "
