@@ -1502,22 +1502,35 @@ class AggressiveBot:
             # Oportunistyczny BUY (BULL + Claude buy_signal) — max $300, limit $500/dzień
             # Blokowany gdy partner widzi CRASH lub symbol sprzedany dziś
             elif opportunistic_entry and cooled and can_trade and partner_ok and not sold_today:
-                # Kwota: min(opp_max_position, pozostały dzienny budżet, dostępny cash)
-                opp_amount = min(
-                    self.cfg.opp_max_position,
-                    self.cfg.opp_daily_limit - self._opp_daily_spent,
-                    cash * 0.95
-                )
-                qty = opp_amount / price if opp_amount >= 50 else 0
-                buy_mode = "OPPORTUNISTIC"
-                buy_pct  = opp_amount / cash if cash > 0 else 0
-                if qty == 0:
-                    logger.info(f"{sym} | ⏭️ OPPORTUNISTIC pominięty — za mało cash (${opp_amount:.0f} < $50)")
+                # Kwota: filtr dnia tygodnia dla OPPORTUNISTIC BUY
+                _dow = utc_now().weekday()  # 0=Pon, 1=Wt, 2=Śr, 3=Czw, 4=Pt
+                _dow_limits = {0: 0, 1: 300, 2: 200, 3: 300, 4: 150}
+                _dow_names  = {0: 'Poniedziałek', 1: 'Wtorek', 2: 'Środa', 3: 'Czwartek', 4: 'Piątek'}
+                _dow_max = _dow_limits.get(_dow, 200)
+
+                if _dow_max == 0:
+                    logger.info(f"{sym} | 🚫 OPP zablokowany — {_dow_names[_dow]} (słaby dzień)")
+                    qty = 0
+                    buy_mode = None
+                    buy_pct = 0
                 else:
-                    logger.info(
-                        f"{sym} | 🔔 OPPORTUNISTIC BUY ${opp_amount:.0f} "
-                        f"(dzienny limit: ${self._opp_daily_spent:.0f}+${opp_amount:.0f}/${self.cfg.opp_daily_limit:.0f}) "
-                        f"| 🤝 {self.bot_sync.other if self.bot_sync else 'solo'}: {partner_reason}")
+                    # Kwota: min(limit dnia, opp_max_position, pozostały dzienny budżet, cash)
+                    opp_amount = min(
+                        _dow_max,
+                        self.cfg.opp_max_position,
+                        self.cfg.opp_daily_limit - self._opp_daily_spent,
+                        cash * 0.95
+                    )
+                    qty = opp_amount / price if opp_amount >= 50 else 0
+                    buy_mode = "OPPORTUNISTIC"
+                    buy_pct  = opp_amount / cash if cash > 0 else 0
+                    if qty == 0:
+                        logger.info(f"{sym} | ⏭️ OPPORTUNISTIC pominięty — za mało cash (${opp_amount:.0f} < $50)")
+                    else:
+                        logger.info(
+                            f"{sym} | 🔔 OPPORTUNISTIC BUY ${opp_amount:.0f} [{_dow_names[_dow]}] "
+                            f"(dzienny limit: ${self._opp_daily_spent:.0f}+${opp_amount:.0f}/${self.cfg.opp_daily_limit:.0f}) "
+                            f"| 🤝 {self.bot_sync.other if self.bot_sync else 'solo'}: {partner_reason}")
 
             # Crash BUY (BEAR regime + Claude buy_signal) — 30%
             elif crash_entry and cooled and can_trade and not sold_today:
@@ -1618,28 +1631,31 @@ class AggressiveBot:
                         f"P/L: {pnl_now:+.2f}%")
 
             # PDT PROTECTION: Nie sprzedawaj tego samego dnia co kupiłeś
-            # Sprawdzamy DB + datę pozycji z Alpaca (na wypadek restartu bota)
+            # Sprawdzamy DB + orders Alpaca (na wypadek restartu bota gdy DB pusta)
             pdt_block = self.db.bought_today(sym)
 
-            # Dodatkowe sprawdzenie przez Alpaca - jeśli DB jest pusta po restarcie
             if not pdt_block and pos:
                 try:
-                    pos_data = pos.model_dump() if hasattr(pos, 'model_dump') else {}
-                    # Alpaca zwraca asset_marginable i inne pola ale nie datę zakupu wprost
-                    # Sprawdzamy avg_entry_price - jeśli pozycja z dziś, DB powinna mieć wpis
-                    # Fallback: jeśli brak wpisu w DB a pozycja istnieje, sprawdź orders API
-                    orders = self.trading.get_orders(filter=dict(symbols=[sym], status='filled', limit=1))
-                    if orders:
-                        import datetime as _dt
-                        order_date = orders[0].filled_at
-                        if order_date:
-                            today_utc = utc_now().strftime("%Y-%m-%d")
-                            order_day = order_date.strftime("%Y-%m-%d") if hasattr(order_date, 'strftime') else str(order_date)[:10]
-                            if order_day == today_utc:
+                    from alpaca.trading.requests import GetOrdersRequest
+                    from alpaca.trading.enums import QueryOrderStatus
+                    req = GetOrdersRequest(
+                        symbols=[sym],
+                        status=QueryOrderStatus.CLOSED,
+                        side=OrderSide.BUY,
+                        limit=5
+                    )
+                    orders = self.trading.get_orders(filter=req)
+                    today_utc = utc_now().strftime("%Y-%m-%d")
+                    for o in orders:
+                        filled = o.filled_at
+                        if filled:
+                            day = filled.strftime("%Y-%m-%d") if hasattr(filled, 'strftime') else str(filled)[:10]
+                            if day == today_utc:
                                 pdt_block = True
-                                logger.info(f"{sym} | ⏳ PDT HOLD (Alpaca orders) - kupione dziś o {order_date}")
-                except Exception:
-                    pass
+                                logger.info(f"{sym} | ⏳ PDT HOLD (Alpaca) — kupione dziś, czekam do jutra")
+                                break
+                except Exception as e:
+                    logger.warning(f"{sym} PDT Alpaca check błąd: {e}")
 
             if pdt_block and (tp_hit or sl_hit):
                 logger.info(
