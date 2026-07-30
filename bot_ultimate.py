@@ -1,6 +1,21 @@
-# bot_ultimate.py — ULTIMATE TRADING BOT v7.0 ADAPTIVE
+# bot_ultimate.py — ULTIMATE TRADING BOT v7.1 ADAPTIVE
 # Strategy: Yesterday's Low + Rebound + Sentiment + Regime Detection + Claude AI Market Analysis
 #
+# ============================================================================
+# v7.1 CHANGES (30.07.2026):
+# ============================================================================
+#   ✅ QQQ ZAMIAST SPY — regime + analyzer oceniają Nasdaq-100 (rynek na którym
+#      gra bot), nie S&P500. Fix: SPY trzymał się dzięki rotacji do finansów,
+#      a portfel tech leciał -13% przy regime "BULL" (lipiec 2026)
+#   ✅ FILTR EARNINGS — brak BUY na X dni przed wynikami spółki (env EARNINGS_DATES
+#      + EARNINGS_BLOCK_DAYS). Fix: gapy overnight TSLA -11%, AMD -11%, GOOGL -7%
+#   ✅ P/L DZIŚ Z last_equity — baseline dnia = equity z zamknięcia poprzedniej
+#      sesji (Alpaca acct.last_equity), nie equity z momentu restartu procesu
+#   ✅ EOD PO SESJI NY — raport dzienny generowany po 16:00 NY (nie o północy UTC)
+#   ✅ WALIDATOR buy_signal — kod odrzuca buy od Claude gdy RSI>38 lub 5d>0
+#      (model dawał TAK przy RSI 68 wbrew regułom promptu)
+#   ✅ TRYB NORMAL — trzeci tryb w prompcie (nie wszystko jest DIP albo CRASH)
+#   ✅ SHEETS: market_mode w trade'ach + avg_win/avg_loss/profit_factor w summary
 # ============================================================================
 # v7.0 CHANGES (Mar 2026):
 # ============================================================================
@@ -221,22 +236,95 @@ def can_trade_now() -> bool:
     return now_ny >= trade_start
 
 
+# ============================================================================
+# v7.1: FILTR EARNINGS — brak BUY przed wynikami spółki
+# ============================================================================
+# Gapy overnight na earnings to główne źródło strat (TSLA -11%, AMD -11%,
+# GOOGL -7% w lipcu 2026). SL software'owy nie chroni przed gapem na otwarciu.
+#
+# ŹRÓDŁO PRAWDY: zmienna env EARNINGS_DATES, format:
+#   EARNINGS_DATES="TSLA:2026-10-21,GOOGL:2026-10-27,MSFT:2026-10-27;2027-01-26"
+#   (przecinek rozdziela spółki, średnik rozdziela wiele dat jednej spółki)
+#
+# EARNINGS_BLOCK_DAYS (domyślnie 2) = ile dni PRZED datą wyników blokować BUY
+# (dzień wyników też jest blokowany).
+#
+# !!! DATY PONIŻEJ TO PLACEHOLDER — ZWERYFIKUJ na nasdaq.com/market-activity/
+# earnings i UZUPEŁNIAJ CO KWARTAŁ (albo nadpisz przez env EARNINGS_DATES) !!!
+DEFAULT_EARNINGS_DATES: Dict[str, List[str]] = {
+    # Q2 2026 (sezon lipiec/sierpień) — DO WERYFIKACJI:
+    "MSFT":  ["2026-07-30"],
+    "META":  ["2026-07-30"],
+    "AAPL":  ["2026-07-31"],
+    "AMZN":  ["2026-07-31"],
+    "NVDA":  ["2026-08-26"],   # NVDA raportuje przesunięty kwartał (koniec sierpnia)
+    # TSLA / GOOGL / AMD — wyniki Q2 już za nami (22-28.07), dopisz daty Q3 w październiku
+    "TSLA":  [],
+    "GOOGL": [],
+    "AMD":   [],
+}
+
+
+def load_earnings_dates() -> Dict[str, List[str]]:
+    """Łączy DEFAULT_EARNINGS_DATES z env EARNINGS_DATES (env nadpisuje spółkę)."""
+    dates = {k: list(v) for k, v in DEFAULT_EARNINGS_DATES.items()}
+    raw = os.getenv("EARNINGS_DATES", "").strip()
+    if raw:
+        try:
+            for part in raw.split(","):
+                part = part.strip()
+                if not part or ":" not in part:
+                    continue
+                sym, ds = part.split(":", 1)
+                dates[sym.strip().upper()] = [d.strip() for d in ds.split(";") if d.strip()]
+            logger.info(f"EarningsFilter: daty z env EARNINGS_DATES załadowane ({len(raw.split(','))} wpisów)")
+        except Exception as e:
+            logger.error(f"EarningsFilter: błąd parsowania EARNINGS_DATES: {e} — używam domyślnych")
+    return dates
+
+
+def is_earnings_blocked(sym: str, earnings_dates: Dict[str, List[str]],
+                        block_days: int = 2) -> Tuple[bool, str]:
+    """
+    Zwraca (czy_blokowac_BUY, powod).
+    Blokuje od block_days dni przed datą wyników do dnia wyników włącznie.
+    Daty porównywane w strefie NY (dzień sesyjny), nie UTC.
+    """
+    try:
+        import pytz
+        today_ny = datetime.now(pytz.timezone('America/New_York')).date()
+        for d_str in earnings_dates.get(sym.upper(), []):
+            try:
+                e_date = datetime.strptime(d_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            delta = (e_date - today_ny).days
+            if 0 <= delta <= block_days:
+                return True, f"wyniki {d_str} (za {delta} dni)"
+    except Exception as e:
+        logger.warning(f"EarningsFilter: błąd sprawdzania {sym}: {e}")
+    return False, ""
+
+
 
 # ============================================================================
 # v7.0: MARKET ANALYZER — Claude AI ocenia czy spadek to dip czy krach
 # ============================================================================
 class MarketAnalyzer:
     """
-    Łączy dane techniczne SPY z analizą Claude AI.
-    
+    v7.1: Łączy dane techniczne QQQ (Nasdaq-100 — rynek na którym gra bot)
+    z analizą Claude AI.
+
     Tryby pozycji (position_mode):
-      DIP       → chwilowy spadek, trzymaj pozycję z trailing stopem
+      NORMAL    → zwykły rynek, brak okazji ani zagrożenia (buy_signal zawsze false)
+      DIP       → wyprzedanie po spadkach, można ostrożnie kupować
       CRASH     → silny trend spadkowy, sprzedaj pozycje na minusie
       UNKNOWN   → brak danych, zachowaj się jak przy DIP (ostrożnie)
     
     Analiza co MARKET_ANALYSIS_INTERVAL sekund (domyślnie 1800 = 30 min).
     """
 
+    MODE_NORMAL = "NORMAL"
     MODE_DIP   = "DIP"
     MODE_CRASH = "CRASH"
     MODE_UNKNOWN = "UNKNOWN"
@@ -260,10 +348,10 @@ class MarketAnalyzer:
     # Dane techniczne SPY
     # ------------------------------------------------------------------
     def _get_spy_data(self) -> dict:
-        """Zbiera wskaźniki SPY: ceny, EMA20/50, RSI14, zmiana 1d/5d/20d."""
+        """v7.1: Zbiera wskaźniki QQQ (Nasdaq-100): ceny, EMA20/50, RSI14, zmiana 1d/5d/20d."""
         try:
             req = StockBarsRequest(
-                symbol_or_symbols="SPY",
+                symbol_or_symbols="QQQ",
                 timeframe=TimeFrame(1, TimeFrameUnit.Day),
                 start=utc_now() - timedelta(days=70),
                 end=utc_now(),
@@ -275,7 +363,7 @@ class MarketAnalyzer:
 
             if isinstance(df.index, pd.MultiIndex):
                 df = df.reset_index()
-                df = df[df["symbol"] == "SPY"].set_index("timestamp")
+                df = df[df["symbol"] == "QQQ"].set_index("timestamp")
             df = df.sort_index()
 
             closes = df["close"].tolist()
@@ -319,7 +407,7 @@ class MarketAnalyzer:
                 "bars_count": len(closes),
             }
         except Exception as e:
-            logger.error(f"MarketAnalyzer: błąd danych SPY: {e}")
+            logger.error(f"MarketAnalyzer: błąd danych QQQ: {e}")
             return {}
 
     # ------------------------------------------------------------------
@@ -334,31 +422,30 @@ class MarketAnalyzer:
             return self.MODE_UNKNOWN, "Brak klucza Anthropic API"
 
         prompt = f"""Jesteś ekspertem analizy technicznej giełdy USA.
-Przeanalizuj dane SPY (S&P 500 ETF) i oceń sytuację rynkową.
+Przeanalizuj dane QQQ (Nasdaq-100 ETF — big tech) i oceń sytuację rynkową.
 
-Dane SPY:
+Dane QQQ:
 - Cena: ${spy.get('current_price')} | EMA20: {spy.get('ema20')} | EMA50: {spy.get('ema50')}
 - RSI14: {spy.get('rsi14')}
 - Zmiana 1d: {spy.get('change_1d')}% | 5d: {spy.get('change_5d')}% | 10d: {spy.get('change_10d')}% | 20d: {spy.get('change_20d')}%
 - Wolumen ratio (5d/20d): {spy.get('volume_ratio')}x | Trend wolumenu (3d/3d-prev): {spy.get('volume_trend')}x
 
-Zasady oceny:
-NIE KUPUJ (CRASH) gdy:
-- Trend spadkowy > 2 tygodnie (change_10d < -5%)
-- Wolumen sprzedaży rośnie (volume_trend > 1.2 = panika)
-- RSI > 35 (rynek jeszcze nie wyprzedany)
+Zwróć jeden z TRZECH trybów:
+- NORMAL = zwykły rynek (wzrosty, konsolidacja, drobne wahania). To domyślny tryb.
+- DIP = rynek wyprzedany po wyraźnych spadkach, panika się wyczerpuje, okazja do ostrożnego kupna.
+- CRASH = silny trend spadkowy, panika trwa, nie kupuj, zamknij straty.
 
-KUP OSTROŻNIE (DIP) gdy:
-- RSI < 32 (rynek mocno wyprzedany)
-- Wolumen sprzedaży maleje (volume_trend < 0.85 = wyczerpanie paniki)
-- Lub pojawił się sygnał odwrócenia (RSI < 35 + volume_trend < 1.0)
-
-Zwróć jeden z trybów:
-- DIP = chwilowa korekta, można kupować (mała pozycja)
-- CRASH = silny trend spadkowy, nie kupuj, zamknij straty
+TWARDE REGUŁY (bezwzględne, nie interpretuj ich inaczej):
+1. Jeśli RSI14 > 40 → tryb NIE MOŻE być DIP. Wybierz NORMAL lub CRASH.
+2. Jeśli change_5d > 0 → buy_signal MUSI być false.
+3. buy_signal=true TYLKO gdy: RSI14 < 32, LUB (RSI14 < 35 ORAZ volume_trend < 1.0).
+4. W trybie NORMAL buy_signal ZAWSZE false.
+5. CRASH gdy: change_10d < -5% ORAZ volume_trend > 1.2 (panika rośnie).
+6. Malejący wolumen przy rosnących cenach to słabnące momentum (sygnał ostrzegawczy),
+   NIE "wyczerpanie paniki" — wyczerpanie paniki wymaga wcześniejszych SPADKÓW cen.
 
 Odpowiedz DOKŁADNIE w tym formacie JSON (nic poza JSON):
-{{"mode": "DIP" lub "CRASH", "confidence": 0-100, "buy_signal": true/false, "reasoning": "max 2 zdania po polsku"}}"""
+{{"mode": "NORMAL" lub "DIP" lub "CRASH", "confidence": 0-100, "buy_signal": true/false, "reasoning": "max 2 zdania po polsku"}}"""
 
         try:
             resp = requests.post(
@@ -386,12 +473,29 @@ Odpowiedz DOKŁADNIE w tym formacie JSON (nic poza JSON):
             mode       = result.get("mode", self.MODE_UNKNOWN).upper()
             confidence = result.get("confidence", 50)
             reasoning  = result.get("reasoning", "brak uzasadnienia")
-            buy_signal = result.get("buy_signal", False)
+            buy_signal = bool(result.get("buy_signal", False))
 
-            if mode not in (self.MODE_DIP, self.MODE_CRASH):
+            if mode not in (self.MODE_NORMAL, self.MODE_DIP, self.MODE_CRASH):
                 mode = self.MODE_UNKNOWN
 
-            self._buy_signal = bool(buy_signal)
+            # ================================================================
+            # v7.1: WALIDATOR — kryteria numeryczne egzekwuje KOD, nie prompt.
+            # Model potrafi dać buy_signal=true przy RSI 68 wbrew regułom
+            # (potwierdzone w logach lipiec 2026), więc odrzucamy twardo.
+            # ================================================================
+            rsi_now = float(spy.get('rsi14', 50) or 50)
+            chg5_now = float(spy.get('change_5d', 0) or 0)
+            if buy_signal and (rsi_now > 38 or chg5_now > 0):
+                buy_signal = False
+                reasoning += f" [WALIDATOR: buy odrzucone — RSI {rsi_now} / 5d {chg5_now:+}% nie potwierdza wyprzedania]"
+            if mode == self.MODE_NORMAL and buy_signal:
+                buy_signal = False
+                reasoning += " [WALIDATOR: NORMAL → buy zawsze false]"
+            if mode == self.MODE_DIP and rsi_now > 40:
+                mode = self.MODE_NORMAL
+                reasoning += f" [WALIDATOR: RSI {rsi_now} > 40 → DIP zmienione na NORMAL]"
+
+            self._buy_signal = buy_signal
             return mode, f"[{confidence}% pewności] {reasoning}"
 
         except Exception as e:
@@ -409,9 +513,9 @@ Odpowiedz DOKŁADNIE w tym formacie JSON (nic poza JSON):
 
         spy = self._get_spy_data()
         if not spy:
-            logger.warning("MarketAnalyzer: brak danych SPY — tryb UNKNOWN")
+            logger.warning("MarketAnalyzer: brak danych QQQ — tryb UNKNOWN")
             self._mode = self.MODE_UNKNOWN
-            self._reasoning = "Brak danych SPY"
+            self._reasoning = "Brak danych QQQ"
             self._last_check = now
             return self._mode
 
@@ -421,10 +525,10 @@ Odpowiedz DOKŁADNIE w tym formacie JSON (nic poza JSON):
         self._reasoning = reasoning
         self._last_check = now
 
-        emoji = "📉" if mode == self.MODE_CRASH else "🔄" if mode == self.MODE_DIP else "❓"
+        emoji = "📉" if mode == self.MODE_CRASH else "🔄" if mode == self.MODE_DIP else "🟢" if mode == self.MODE_NORMAL else "❓"
         logger.info(
             f"MarketAnalyzer {emoji} {mode} | "
-            f"SPY={spy['current_price']} RSI={spy['rsi14']} "
+            f"QQQ={spy['current_price']} RSI={spy['rsi14']} "
             f"5d={spy['change_5d']}% EMA20/50={spy['ema20']}/{spy['ema50']} | "
             f"{reasoning}"
         )
@@ -469,7 +573,9 @@ Odpowiedz DOKŁADNIE w tym formacie JSON (nic poza JSON):
 # ============================================================================
 class RegimeDetector:
     """
-    Wykrywa typ rynku na podstawie SPY (proxy S&P500).
+    v7.1: Wykrywa typ rynku na podstawie QQQ (Nasdaq-100 — rynek na którym gra bot).
+    Wcześniej SPY — ale SPY trzymał się dzięki rotacji do finansów/healthcare,
+    gdy tech leciał w korektę (lipiec 2026) i gate nigdy nie zadziałał.
     Wyłącza bota gdy rynek spada - to był problem 27.02.2026!
     
     Regime'y:
@@ -490,10 +596,10 @@ class RegimeDetector:
         self._last_reason = "Nie sprawdzono"
     
     def _get_spy_closes(self, days: int = 60) -> List[float]:
-        """Pobiera zamknięcia SPY z ostatnich N dni"""
+        """v7.1: Pobiera zamknięcia QQQ (Nasdaq-100) z ostatnich N dni"""
         try:
             req = StockBarsRequest(
-                symbol_or_symbols="SPY",
+                symbol_or_symbols="QQQ",
                 timeframe=TimeFrame(1, TimeFrameUnit.Day),
                 start=utc_now() - timedelta(days=days + 10),
                 end=utc_now(),
@@ -506,11 +612,11 @@ class RegimeDetector:
             
             if isinstance(df.index, pd.MultiIndex):
                 df = df.reset_index()
-                df = df[df["symbol"] == "SPY"].set_index("timestamp")
+                df = df[df["symbol"] == "QQQ"].set_index("timestamp")
             
             return df['close'].tolist()
         except Exception as e:
-            logger.error(f"RegimeDetector: błąd pobierania SPY: {e}")
+            logger.error(f"RegimeDetector: błąd pobierania QQQ: {e}")
             return []
     
     def _calc_ema(self, prices: List[float], span: int) -> float:
@@ -534,12 +640,12 @@ class RegimeDetector:
         if self._last_regime is not None and (now - self._last_check) < self.check_interval:
             return self._last_regime
         
-        logger.info("🔍 RegimeDetector: sprawdzam rynek (SPY)...")
+        logger.info("🔍 RegimeDetector: sprawdzam rynek (QQQ)...")
         
         closes = self._get_spy_closes(days=60)
         
         if len(closes) < 20:
-            logger.warning("RegimeDetector: za mało danych SPY, domyślnie STOP")
+            logger.warning("RegimeDetector: za mało danych QQQ, domyślnie STOP")
             self._last_regime = False
             self._last_check = now
             return False
@@ -560,7 +666,7 @@ class RegimeDetector:
         
         # BEAR - najważniejszy przypadek
         if ema_20 < ema_50 and spy_5d < spy_threshold_pct:
-            self._last_reason = f"🛑 BEAR: EMA20({ema_20:.1f}) < EMA50({ema_50:.1f}), SPY 5d: {spy_5d:.1f}%"
+            self._last_reason = f"🛑 BEAR: EMA20({ema_20:.1f}) < EMA50({ema_50:.1f}), QQQ 5d: {spy_5d:.1f}%"
             logger.warning(f"RegimeDetector: BEAR MARKET | {self._last_reason}")
             self._last_regime = False
             self._last_check = now
@@ -576,9 +682,9 @@ class RegimeDetector:
         
         # BULL lub SIDEWAYS - traduj
         if ema_20 >= ema_50:
-            self._last_reason = f"✅ BULL: EMA20({ema_20:.1f}) >= EMA50({ema_50:.1f}), SPY 5d: {spy_5d:.1f}%"
+            self._last_reason = f"✅ BULL: EMA20({ema_20:.1f}) >= EMA50({ema_50:.1f}), QQQ 5d: {spy_5d:.1f}%"
         else:
-            self._last_reason = f"✅ SIDEWAYS: SPY 5d: {spy_5d:.1f}% (powyżej progu {spy_threshold_pct}%)"
+            self._last_reason = f"✅ SIDEWAYS: QQQ 5d: {spy_5d:.1f}% (powyżej progu {spy_threshold_pct}%)"
         
         logger.info(f"RegimeDetector: OK | {self._last_reason}")
         self._last_regime = True
@@ -967,7 +1073,8 @@ class SheetsWebhook:
     def send_trade(self, symbol: str, action: str, price: float,
                    entry_price: float = None, pl_pct: float = None,
                    reason: str = "", atr: float = 0, sentiment: float = 0,
-                   rebound_pct: float = 0, yday_low: float = 0, equity: float = 0):
+                   rebound_pct: float = 0, yday_low: float = 0, equity: float = 0,
+                   market_mode: str = ""):
         return self._send({
             "type": "trade",
             "timestamp": utc_now().isoformat(),
@@ -982,7 +1089,9 @@ class SheetsWebhook:
             "rebound_pct": rebound_pct,
             "yday_low": yday_low,
             "equity": equity,
-            "regime": self._last_regime
+            "regime": self._last_regime,
+            # v7.1: fix pustej kolumny "Market Mode" w arkuszu
+            "market_mode": market_mode
         })
     
     def send_regime(self, regime: str, should_trade: bool, reason: str, spy_trend: float = 0):
@@ -997,7 +1106,9 @@ class SheetsWebhook:
         })
     
     def send_summary(self, date: str, start_equity: float, end_equity: float,
-                     total_trades: int, winning_trades: int):
+                     total_trades: int, winning_trades: int,
+                     avg_win: float = 0.0, avg_loss: float = 0.0,
+                     profit_factor: float = 0.0):
         pnl = end_equity - start_equity
         pnl_pct = round(pnl / start_equity * 100, 2) if start_equity > 0 else 0
         win_rate = round(winning_trades / total_trades * 100, 1) if total_trades > 0 else 0
@@ -1011,6 +1122,10 @@ class SheetsWebhook:
             "total_trades": total_trades,
             "winning_trades": winning_trades,
             "win_rate": win_rate,
+            # v7.1: win rate sam kłamie — te trzy pokazują skośność strategii
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "profit_factor": profit_factor,
             "regime": self._last_regime
         })
 
@@ -1181,11 +1296,17 @@ class AggressiveBot:
         self.start_equity: Optional[float] = None
         self._opp_daily_spent: float = 0.0   # ile $ wydano na OPPORTUNISTIC dziś
         self._opp_daily_date: str = ""        # data resetu licznika
+
+        # v7.1: Filtr earnings
+        self.earnings_dates = load_earnings_dates()
+        self.earnings_block_days = int(os.getenv("EARNINGS_BLOCK_DAYS", "2"))
         
         self._load_entry_prices()
         
-        logger.info(f"AggressiveBot v7.0 ADAPTIVE | Strategy: DIP BUYING + REGIME DETECTION + CLAUDE AI")
-        logger.info(f"Regime Detection: {'ON' if cfg.regime_enabled else 'OFF'}")
+        logger.info(f"AggressiveBot v7.1 ADAPTIVE | Strategy: DIP BUYING + REGIME(QQQ) + CLAUDE AI + EARNINGS FILTER")
+        logger.info(f"Regime Detection: {'ON' if cfg.regime_enabled else 'OFF'} (proxy: QQQ)")
+        logger.info(f"Earnings Filter: blokada BUY {self.earnings_block_days} dni przed wynikami | "
+                    f"daty: { {k: v for k, v in self.earnings_dates.items() if v} }")
         logger.info(f"PDT Fix: GTC orders (stop-lossy działają przez noc!)")
 
     def _load_entry_prices(self):
@@ -1334,8 +1455,14 @@ class AggressiveBot:
         equity = float(acct.equity)
         cash = float(acct.cash)
         
-        if self.start_equity is None:
-            self.start_equity = equity
+        # v7.1: baseline dnia = equity z zamknięcia POPRZEDNIEJ sesji (Alpaca
+        # last_equity), a nie equity z momentu restartu procesu na Railway.
+        # Dzięki temu "P/L dziś" jest poprawne niezależnie od redeployów.
+        try:
+            self.start_equity = float(acct.last_equity)
+        except Exception:
+            if self.start_equity is None:
+                self.start_equity = equity
         
         try:
             positions = {p.symbol: p for p in self.trading.get_all_positions()}
@@ -1442,6 +1569,13 @@ class AggressiveBot:
             if sold_today:
                 logger.info(f"{sym} | ⛔ PDT: sprzedany dziś — pomijam BUY do jutra")
 
+            # v7.1: FILTR EARNINGS — nie otwieraj pozycji przed wynikami spółki
+            # (gap overnight przelatuje przez każdy software'owy SL)
+            earnings_block, earnings_reason = is_earnings_blocked(
+                sym, self.earnings_dates, self.earnings_block_days)
+            if earnings_block:
+                logger.info(f"{sym} | 📊 EARNINGS BLOCK: {earnings_reason} — pomijam BUY")
+
             # v7.0: Pobierz ocenę rynku od Claude AI
             market_mode = MarketAnalyzer.MODE_UNKNOWN
             claude_buy_signal = False
@@ -1494,14 +1628,14 @@ class AggressiveBot:
                 logger.info(f"{sym} | 🛑 BEAR MARKET - pomijam BUY mimo sygnału")
 
             # Normalny BUY (bull/sideways + klasyczny dip) — cały kapitał (95%)
-            if entry_signal and cooled and can_trade and allow_buy and not sold_today:
+            if entry_signal and cooled and can_trade and allow_buy and not sold_today and not earnings_block:
                 qty = (cash * self.cfg.max_pos_pct) / price
                 buy_mode = "NORMAL"
                 buy_pct = self.cfg.max_pos_pct
 
             # Oportunistyczny BUY (BULL + Claude buy_signal) — max $300, limit $500/dzień
             # Blokowany gdy partner widzi CRASH lub symbol sprzedany dziś
-            elif opportunistic_entry and cooled and can_trade and partner_ok and not sold_today:
+            elif opportunistic_entry and cooled and can_trade and partner_ok and not sold_today and not earnings_block:
                 # Kwota: filtr dnia tygodnia dla OPPORTUNISTIC BUY
                 _dow = utc_now().weekday()  # 0=Pon, 1=Wt, 2=Śr, 3=Czw, 4=Pt
                 _dow_limits = {0: 0, 1: 300, 2: 200, 3: 300, 4: 150}
@@ -1533,7 +1667,7 @@ class AggressiveBot:
                             f"| 🤝 {self.bot_sync.other if self.bot_sync else 'solo'}: {partner_reason}")
 
             # Crash BUY (BEAR regime + Claude buy_signal) — 30%
-            elif crash_entry and cooled and can_trade and not sold_today:
+            elif crash_entry and cooled and can_trade and not sold_today and not earnings_block:
                 qty = (cash * self.cfg.crash_buy_pct) / price
                 buy_mode = "CRASH_BUY"
                 buy_pct = self.cfg.crash_buy_pct
@@ -1585,7 +1719,8 @@ class AggressiveBot:
                             symbol=sym, action="BUY", price=price,
                             entry_price=price, pl_pct=None, reason=reason,
                             atr=atr_val, sentiment=sentiment_score,
-                            rebound_pct=rebound_pct, yday_low=yday_low or 0, equity=equity)
+                            rebound_pct=rebound_pct, yday_low=yday_low or 0, equity=equity,
+                            market_mode=market_mode)
         
         else:
             # ----------------------------------------------------------------
@@ -1685,7 +1820,8 @@ class AggressiveBot:
                         symbol=sym, action="SELL", price=price,
                         entry_price=entry, pl_pct=pnl_pct, reason=reason,
                         atr=atr_val, sentiment=sentiment_score,
-                        rebound_pct=rebound_pct or 0, yday_low=yday_low or 0, equity=equity)
+                        rebound_pct=rebound_pct or 0, yday_low=yday_low or 0, equity=equity,
+                        market_mode=market_mode)
         
         if action != "HOLD":
             self.db.insert_signal(
@@ -1701,27 +1837,47 @@ class AggressiveBot:
 
     def generate_eod_report(self):
         today = utc_now().strftime("%Y-%m-%d")
+        start_equity = None
         try:
-            end_equity = float(self.trading.get_account().equity)
+            acct = self.trading.get_account()
+            end_equity = float(acct.equity)
+            # v7.1: baseline = zamknięcie poprzedniej sesji wg Alpaki
+            try:
+                start_equity = float(acct.last_equity)
+            except Exception:
+                pass
         except Exception:
             end_equity = 0.0
         
-        start_equity = self.start_equity or end_equity
+        if not start_equity:
+            start_equity = self.start_equity or end_equity
         
         cur = self.db.conn.execute(
             "SELECT action, entry_price, price FROM signals WHERE DATE(ts_utc)=? AND action IN ('BUY','SELL')",
             (today,))
         trades = cur.fetchall()
         
-        total = len([t for t in trades if t[0] == 'SELL'])
-        wins = sum(1 for a, e, p in trades if a == 'SELL' and e and p and p > e)
+        # v7.1: pełne statystyki dnia — win rate sam w sobie kłamie przy
+        # ujemnej skośności (80% wygranych i stratny dzień, patrz 27.07.2026)
+        sell_pls = [ (p - e) / e * 100 for a, e, p in trades
+                     if a == 'SELL' and e and p and e > 0 ]
+        total = len(sell_pls)
+        win_pls  = [x for x in sell_pls if x > 0]
+        loss_pls = [x for x in sell_pls if x <= 0]
+        wins = len(win_pls)
+        avg_win  = round(sum(win_pls) / len(win_pls), 2) if win_pls else 0.0
+        avg_loss = round(sum(loss_pls) / len(loss_pls), 2) if loss_pls else 0.0
+        gross_win  = sum(win_pls)
+        gross_loss = abs(sum(loss_pls))
+        profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
         pnl = end_equity - start_equity
         
         report = {
             "date": today, "start_equity": start_equity, "end_equity": end_equity,
             "pnl_realized": pnl, "pnl_pct": (pnl / start_equity * 100) if start_equity > 0 else 0,
             "total_trades": total, "winning_trades": wins,
-            "win_rate": (wins / total * 100) if total > 0 else 0
+            "win_rate": (wins / total * 100) if total > 0 else 0,
+            "avg_win": avg_win, "avg_loss": avg_loss, "profit_factor": profit_factor
         }
         
         self.db.conn.execute(
@@ -1731,9 +1887,12 @@ class AggressiveBot:
         
         logger.info(f"\n{'='*60}\nEOD REPORT {today}\n{'='*60}\n"
                      f"Start: ${start_equity:,.2f} | End: ${end_equity:,.2f} | P/L: ${pnl:+,.2f} ({report['pnl_pct']:+.2f}%)\n"
-                     f"Trades: {total} | Wins: {wins} | Rate: {report['win_rate']:.1f}%\n{'='*60}")
-        # v7.0: Wyślij summary do Google Sheets
-        self.sheets.send_summary(today, start_equity, end_equity, total, wins)
+                     f"Trades: {total} | Wins: {wins} | Rate: {report['win_rate']:.1f}%\n"
+                     f"Avg win: {avg_win:+.2f}% | Avg loss: {avg_loss:+.2f}% | Profit factor: {profit_factor}\n{'='*60}")
+        # v7.1: Wyślij summary do Google Sheets (z nowymi statystykami)
+        self.sheets.send_summary(today, start_equity, end_equity, total, wins,
+                                 avg_win=avg_win, avg_loss=avg_loss,
+                                 profit_factor=profit_factor)
         return report
 
     def run(self):
@@ -1758,8 +1917,15 @@ class AggressiveBot:
             try:
                 if not can_trade_now():
                     if not is_market_hours():
-                        current_date = utc_now().strftime("%Y-%m-%d")
-                        if current_date != last_eod_date:
+                        # v7.1: EOD generowany PO zamknięciu sesji NY (>=16:00 NY,
+                        # dni robocze), nie o północy UTC — wcześniej raport łapał
+                        # zły dzień i mieszał okna czasowe (snapshot 02:00 CEST)
+                        import pytz
+                        now_ny = datetime.now(pytz.timezone('America/New_York'))
+                        current_date = now_ny.strftime("%Y-%m-%d")
+                        if (current_date != last_eod_date
+                                and now_ny.weekday() < 5
+                                and now_ny.hour >= 16):
                             self.generate_eod_report()
                             last_eod_date = current_date
                         logger.info("Market closed")
